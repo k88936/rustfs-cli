@@ -124,8 +124,8 @@ rc admin policy create local/ readonly --file policy.json
 # Attach policy to user
 rc admin policy attach local/ readonly --user newuser
 
-# Create a service account
-rc admin service-account add local/ myuser
+# Create a service account (access_key + secret_key)
+rc admin service-account create local/ AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ```
 
 ### Admin Operations (Cluster)
@@ -178,9 +178,9 @@ rc admin heal status local --json
 | Command | Description |
 |---------|-------------|
 | `admin user` | Manage IAM users (add, remove, list, info, enable, disable) |
-| `admin policy` | Manage IAM policies (create, remove, list, info, attach, detach) |
-| `admin group` | Manage IAM groups (add, remove, list, info, member) |
-| `admin service-account` | Manage service accounts (add, remove, list, info, edit) |
+| `admin policy` | Manage IAM policies (create, remove, list, info, attach) |
+| `admin group` | Manage IAM groups (add, remove, list, info, enable, disable, add-members, rm-members) |
+| `admin service-account` | Manage service accounts (create, remove, list, info) |
 | `admin info` | Display cluster information (cluster, server, disk) |
 | `admin heal` | Manage cluster healing operations (status, start, stop) |
 
