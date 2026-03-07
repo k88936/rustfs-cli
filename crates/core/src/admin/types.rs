@@ -315,8 +315,8 @@ pub struct CreateServiceAccountRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<String>,
 
-    /// Optional expiration time (ISO 8601 format)
-    #[serde(rename = "expiration", skip_serializing_if = "Option::is_none")]
+    /// Expiration time (ISO 8601). The `expiration` field must be present in the request body; use null when no expiration is set.
+    #[serde(rename = "expiration")]
     pub expiry: Option<String>,
 
     /// Optional name/description
@@ -479,6 +479,48 @@ mod tests {
             GroupStatus::Disabled
         );
         assert!("invalid".parse::<GroupStatus>().is_err());
+    }
+
+    #[test]
+    fn test_create_service_account_request_includes_expiration() {
+        let request = CreateServiceAccountRequest {
+            policy: None,
+            expiry: None,
+            name: None,
+            description: None,
+            access_key: "myaccesskey".to_string(),
+            secret_key: "mysecretkey".to_string(),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        // expiration field must always be present even when None
+        assert!(
+            json.contains("\"expiration\""),
+            "JSON must contain expiration field, got: {json}"
+        );
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("expiration").is_some());
+        assert!(parsed["expiration"].is_null());
+    }
+
+    #[test]
+    fn test_create_service_account_request_with_expiry() {
+        let request = CreateServiceAccountRequest {
+            policy: None,
+            expiry: Some("2025-12-31T23:59:59Z".to_string()),
+            name: None,
+            description: None,
+            access_key: "myaccesskey".to_string(),
+            secret_key: "mysecretkey".to_string(),
+        };
+
+        let json = serde_json::to_string(&request).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.get("expiration").and_then(|v| v.as_str()),
+            Some("2025-12-31T23:59:59Z")
+        );
     }
 
     #[test]
