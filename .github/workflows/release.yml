@@ -421,30 +421,7 @@ jobs:
           files: release-assets/*
           draft: true
           prerelease: false
-          body: |
-            ## Changes
-
-            See [CHANGELOG.md](CHANGELOG.md) for details.
-
-            ## Installation
-
-            ### Binary Download
-
-            Download the appropriate binary for your platform from the assets below.
-
-            ### Homebrew (macOS/Linux)
-
-            ```bash
-            brew tap rustfs/homebrew-tap
-
-            brew install rustfs/tap/rc
-            ```
-
-            ### Cargo
-
-            ```bash
-            cargo install rustfs-cli
-            ```
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

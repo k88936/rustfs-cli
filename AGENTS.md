@@ -74,10 +74,7 @@ Modifying protected files requires:
    - Config migration: add `migrations/v{N}_to_v{N+1}.rs`
    - Documentation update: update relevant SPEC.md sections
 
-3. **Update CHANGELOG**
-   - Add BREAKING CHANGE entry in CHANGELOG.md
-
-4. **PR marking**
+3. **PR marking**
    - Include `BREAKING` in PR title or description
 
 ---

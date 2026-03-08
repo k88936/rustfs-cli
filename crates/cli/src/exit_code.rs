@@ -3,8 +3,7 @@
 //! This file is protected by CI. Any modifications require the Breaking Change process:
 //! 1. Update version number
 //! 2. Provide migration plan
-//! 3. Update CHANGELOG
-//! 4. Mark PR as BREAKING
+//! 3. Mark PR as BREAKING
 
 /// Exit codes for the rc CLI application.
 ///
