@@ -16,6 +16,12 @@ This document defines the standards and constraints that AI assistants must foll
 
 ## Workflow
 
+### 0. Branch Base Policy
+
+1. For any code change task, always base work on the latest `origin/main`.
+2. Before implementing code changes, run `git fetch origin` and ensure your working branch is created from or rebased onto `origin/main`.
+3. Exception: if the task explicitly asks to fix or update a specific PR branch, continue on that PR branch instead of rebasing to `origin/main` unless explicitly requested.
+
 ### 1. Before Starting
 
 1. Understand the task goals and acceptance criteria
