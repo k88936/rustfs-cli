@@ -318,6 +318,7 @@ impl S3Client {
         file_path: &std::path::Path,
         content_type: Option<&str>,
         file_size: u64,
+        on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
         use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 
@@ -325,6 +326,8 @@ impl S3Client {
         let part_size = config.calculate_part_size(file_size);
         let part_buffer_size = usize::try_from(part_size)
             .map_err(|_| Error::General(format!("invalid part size: {part_size}")))?;
+
+        tracing::debug!(file_size, part_size, "Starting multipart upload");
 
         let mut create_request = self
             .inner
@@ -346,18 +349,23 @@ impl S3Client {
             .ok_or_else(|| Error::General("missing upload id from multipart upload".to_string()))?
             .to_string();
 
+        tracing::debug!(upload_id = %upload_id, "Multipart upload initiated");
+
         let mut file = tokio::fs::File::open(file_path)
             .await
             .map_err(|e| Error::General(format!("open file '{}': {e}", file_path.display())))?;
         let mut completed_parts = Vec::new();
         let mut part_number: i32 = 1;
         let mut chunk = vec![0u8; part_buffer_size];
+        let mut bytes_uploaded: u64 = 0;
 
         loop {
             let bytes_read = Self::read_next_part(&mut file, file_path, &mut chunk).await?;
             if bytes_read == 0 {
                 break;
             }
+
+            tracing::debug!(part_number, bytes_read, "Uploading part");
 
             let body = aws_sdk_s3::primitives::ByteStream::from(chunk[..bytes_read].to_vec());
             let upload_part_result = self
@@ -374,6 +382,11 @@ impl S3Client {
             let upload_part_response = match upload_part_result {
                 Ok(response) => response,
                 Err(e) => {
+                    tracing::debug!(
+                        upload_id = %upload_id,
+                        part_number,
+                        "Aborting multipart upload due to error"
+                    );
                     self.abort_multipart_upload_best_effort(path, &upload_id)
                         .await;
                     return Err(Error::Network(format!(
@@ -399,6 +412,11 @@ impl S3Client {
                     .e_tag(etag)
                     .build(),
             );
+
+            bytes_uploaded += bytes_read as u64;
+            on_progress(bytes_uploaded);
+            tracing::debug!(part_number, bytes_uploaded, "Part uploaded");
+
             part_number += 1;
         }
 
@@ -418,11 +436,14 @@ impl S3Client {
         let complete_response = match complete_result {
             Ok(response) => response,
             Err(e) => {
+                tracing::debug!(upload_id = %upload_id, "Attempting to abort multipart upload after completion failure");
                 self.abort_multipart_upload_best_effort(path, &upload_id)
                     .await;
                 return Err(Error::Network(format!("complete multipart upload: {e}")));
             }
         };
+
+        tracing::debug!("Multipart upload completed");
 
         let mut info = ObjectInfo::file(&path.key, file_size as i64);
         if let Some(etag) = complete_response.e_tag() {
@@ -436,11 +457,13 @@ impl S3Client {
     /// Upload a local file path to S3.
     ///
     /// Uses multipart upload for large files to avoid loading the entire file into memory.
+    /// Calls `on_progress` after each uploaded part with total bytes sent so far.
     pub async fn put_object_from_path(
         &self,
         path: &RemotePath,
         file_path: &std::path::Path,
         content_type: Option<&str>,
+        on_progress: impl Fn(u64) + Send,
     ) -> Result<ObjectInfo> {
         let metadata = tokio::fs::metadata(file_path).await.map_err(|e| {
             Error::General(format!("read metadata for '{}': {e}", file_path.display()))
@@ -454,8 +477,14 @@ impl S3Client {
 
         let file_size = metadata.len();
         if Self::should_use_multipart(file_size) {
-            self.put_object_multipart_from_path(path, file_path, content_type, file_size)
-                .await
+            self.put_object_multipart_from_path(
+                path,
+                file_path,
+                content_type,
+                file_size,
+                on_progress,
+            )
+            .await
         } else {
             self.put_object_single_part_from_path(path, file_path, content_type, file_size)
                 .await
