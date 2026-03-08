@@ -350,7 +350,12 @@ pub struct BucketQuota {
     pub size: u64,
 
     /// Quota type (currently only HARD)
+    #[serde(default = "default_quota_type")]
     pub quota_type: String,
+}
+
+fn default_quota_type() -> String {
+    "HARD".to_string()
 }
 
 #[cfg(test)]
@@ -539,5 +544,16 @@ mod tests {
         let decoded: BucketQuota = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.bucket, "my-bucket");
         assert_eq!(decoded.quota, Some(1024));
+    }
+
+    #[test]
+    fn test_bucket_quota_defaults_quota_type_when_missing() {
+        let json = r#"{"bucket":"my-bucket","quota":1024,"size":512}"#;
+        let decoded: BucketQuota = serde_json::from_str(json).unwrap();
+
+        assert_eq!(decoded.bucket, "my-bucket");
+        assert_eq!(decoded.quota, Some(1024));
+        assert_eq!(decoded.size, 512);
+        assert_eq!(decoded.quota_type, "HARD");
     }
 }
