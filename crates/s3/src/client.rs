@@ -17,6 +17,9 @@ use rc_core::{
     Alias, Capabilities, Error, ListOptions, ListResult, ObjectInfo, ObjectStore, ObjectVersion,
     RemotePath, Result,
 };
+use tokio::io::AsyncReadExt;
+
+const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Custom HTTP connector using reqwest, supporting insecure TLS (skip cert verification)
 /// and custom CA bundles. Used when `alias.insecure = true` or `alias.ca_bundle.is_some()`.
@@ -234,6 +237,228 @@ impl S3Client {
                 format!("Response error: {:?}", err)
             }
             _ => error.to_string(),
+        }
+    }
+
+    fn should_use_multipart(file_size: u64) -> bool {
+        file_size > SINGLE_PUT_OBJECT_MAX_SIZE
+    }
+
+    async fn read_next_part(
+        file: &mut tokio::fs::File,
+        file_path: &std::path::Path,
+        buffer: &mut [u8],
+    ) -> Result<usize> {
+        let mut total_read = 0usize;
+        while total_read < buffer.len() {
+            let bytes_read = file
+                .read(&mut buffer[total_read..])
+                .await
+                .map_err(|e| Error::General(format!("read file '{}': {e}", file_path.display())))?;
+            if bytes_read == 0 {
+                break;
+            }
+            total_read += bytes_read;
+        }
+        Ok(total_read)
+    }
+
+    async fn put_object_single_part_from_path(
+        &self,
+        path: &RemotePath,
+        file_path: &std::path::Path,
+        content_type: Option<&str>,
+        file_size: u64,
+    ) -> Result<ObjectInfo> {
+        let body = aws_sdk_s3::primitives::ByteStream::read_from()
+            .path(file_path)
+            .build()
+            .await
+            .map_err(|e| Error::General(format!("build request body: {e}")))?;
+
+        let mut request = self
+            .inner
+            .put_object()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .body(body);
+
+        if let Some(ct) = content_type {
+            request = request.content_type(ct);
+        }
+
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Error::Network(e.to_string()))?;
+
+        let mut info = ObjectInfo::file(&path.key, file_size as i64);
+        if let Some(etag) = response.e_tag() {
+            info.etag = Some(etag.trim_matches('"').to_string());
+        }
+        info.last_modified = Some(jiff::Timestamp::now());
+
+        Ok(info)
+    }
+
+    async fn abort_multipart_upload_best_effort(&self, path: &RemotePath, upload_id: &str) {
+        let _ = self
+            .inner
+            .abort_multipart_upload()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .upload_id(upload_id)
+            .send()
+            .await;
+    }
+
+    async fn put_object_multipart_from_path(
+        &self,
+        path: &RemotePath,
+        file_path: &std::path::Path,
+        content_type: Option<&str>,
+        file_size: u64,
+    ) -> Result<ObjectInfo> {
+        use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
+
+        let config = crate::multipart::MultipartConfig::default();
+        let part_size = config.calculate_part_size(file_size);
+        let part_buffer_size = usize::try_from(part_size)
+            .map_err(|_| Error::General(format!("invalid part size: {part_size}")))?;
+
+        let mut create_request = self
+            .inner
+            .create_multipart_upload()
+            .bucket(&path.bucket)
+            .key(&path.key);
+
+        if let Some(ct) = content_type {
+            create_request = create_request.content_type(ct);
+        }
+
+        let create_response = create_request
+            .send()
+            .await
+            .map_err(|e| Error::Network(format!("create multipart upload: {e}")))?;
+
+        let upload_id = create_response
+            .upload_id()
+            .ok_or_else(|| Error::General("missing upload id from multipart upload".to_string()))?
+            .to_string();
+
+        let mut file = tokio::fs::File::open(file_path)
+            .await
+            .map_err(|e| Error::General(format!("open file '{}': {e}", file_path.display())))?;
+        let mut completed_parts = Vec::new();
+        let mut part_number: i32 = 1;
+        let mut chunk = vec![0u8; part_buffer_size];
+
+        loop {
+            let bytes_read = Self::read_next_part(&mut file, file_path, &mut chunk).await?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            let body = aws_sdk_s3::primitives::ByteStream::from(chunk[..bytes_read].to_vec());
+            let upload_part_result = self
+                .inner
+                .upload_part()
+                .bucket(&path.bucket)
+                .key(&path.key)
+                .upload_id(&upload_id)
+                .part_number(part_number)
+                .body(body)
+                .send()
+                .await;
+
+            let upload_part_response = match upload_part_result {
+                Ok(response) => response,
+                Err(e) => {
+                    self.abort_multipart_upload_best_effort(path, &upload_id)
+                        .await;
+                    return Err(Error::Network(format!(
+                        "upload multipart part {part_number}: {e}"
+                    )));
+                }
+            };
+
+            let etag = match upload_part_response.e_tag() {
+                Some(value) => value.trim_matches('"').to_string(),
+                None => {
+                    self.abort_multipart_upload_best_effort(path, &upload_id)
+                        .await;
+                    return Err(Error::General(format!(
+                        "missing ETag for multipart part {part_number}"
+                    )));
+                }
+            };
+
+            completed_parts.push(
+                CompletedPart::builder()
+                    .part_number(part_number)
+                    .e_tag(etag)
+                    .build(),
+            );
+            part_number += 1;
+        }
+
+        let completed_upload = CompletedMultipartUpload::builder()
+            .set_parts(Some(completed_parts))
+            .build();
+        let complete_result = self
+            .inner
+            .complete_multipart_upload()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .upload_id(&upload_id)
+            .multipart_upload(completed_upload)
+            .send()
+            .await;
+
+        let complete_response = match complete_result {
+            Ok(response) => response,
+            Err(e) => {
+                self.abort_multipart_upload_best_effort(path, &upload_id)
+                    .await;
+                return Err(Error::Network(format!("complete multipart upload: {e}")));
+            }
+        };
+
+        let mut info = ObjectInfo::file(&path.key, file_size as i64);
+        if let Some(etag) = complete_response.e_tag() {
+            info.etag = Some(etag.trim_matches('"').to_string());
+        }
+        info.last_modified = Some(jiff::Timestamp::now());
+
+        Ok(info)
+    }
+
+    /// Upload a local file path to S3.
+    ///
+    /// Uses multipart upload for large files to avoid loading the entire file into memory.
+    pub async fn put_object_from_path(
+        &self,
+        path: &RemotePath,
+        file_path: &std::path::Path,
+        content_type: Option<&str>,
+    ) -> Result<ObjectInfo> {
+        let metadata = tokio::fs::metadata(file_path).await.map_err(|e| {
+            Error::General(format!("read metadata for '{}': {e}", file_path.display()))
+        })?;
+        if !metadata.is_file() {
+            return Err(Error::General(format!(
+                "source is not a file: {}",
+                file_path.display()
+            )));
+        }
+
+        let file_size = metadata.len();
+        if Self::should_use_multipart(file_size) {
+            self.put_object_multipart_from_path(path, file_path, content_type, file_size)
+                .await
+        } else {
+            self.put_object_single_part_from_path(path, file_path, content_type, file_size)
+                .await
         }
     }
 }
@@ -908,5 +1133,61 @@ mod tests {
             }
             other => panic!("Expected Error::Network for invalid path, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn should_use_multipart_for_large_files() {
+        assert!(S3Client::should_use_multipart(
+            SINGLE_PUT_OBJECT_MAX_SIZE + 1
+        ));
+    }
+
+    #[test]
+    fn should_use_single_part_for_small_files() {
+        assert!(!S3Client::should_use_multipart(0));
+        assert!(!S3Client::should_use_multipart(1024 * 1024));
+        assert!(!S3Client::should_use_multipart(
+            crate::multipart::DEFAULT_PART_SIZE + 1
+        ));
+        assert!(!S3Client::should_use_multipart(SINGLE_PUT_OBJECT_MAX_SIZE));
+    }
+
+    #[tokio::test]
+    async fn read_next_part_fills_buffer_until_eof() {
+        use tokio::io::AsyncWriteExt;
+
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let file_path = temp_dir.path().join("payload.bin");
+        let mut writer = tokio::fs::File::create(&file_path)
+            .await
+            .expect("create temp file");
+        writer
+            .write_all(b"abcdefghij")
+            .await
+            .expect("write temp file");
+        writer.flush().await.expect("flush temp file");
+        drop(writer);
+
+        let mut reader = tokio::fs::File::open(&file_path)
+            .await
+            .expect("open temp file");
+        let mut buffer = vec![0u8; 8];
+
+        let first = S3Client::read_next_part(&mut reader, &file_path, &mut buffer)
+            .await
+            .expect("first read");
+        assert_eq!(first, 8);
+        assert_eq!(&buffer[..first], b"abcdefgh");
+
+        let second = S3Client::read_next_part(&mut reader, &file_path, &mut buffer)
+            .await
+            .expect("second read");
+        assert_eq!(second, 2);
+        assert_eq!(&buffer[..second], b"ij");
+
+        let third = S3Client::read_next_part(&mut reader, &file_path, &mut buffer)
+            .await
+            .expect("third read");
+        assert_eq!(third, 0);
     }
 }
