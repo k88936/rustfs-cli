@@ -51,6 +51,10 @@ This document defines the standards and constraints that AI assistants must foll
    - Commit message format: `feat(phase-N): <description>`
    - Example: `feat(phase-1): implement alias commands and core infrastructure`
 
+Exception (markdown-only non-code updates):
+- If the change only updates Markdown files unrelated to executable code (for example `AGENTS.md`, `README.md`, or other documentation `.md` files), compile/lint/test validation may be skipped.
+- This exception does not apply when changes affect schemas, config behavior, generated outputs, or any Rust/source code.
+
 **Do not commit code when checks have not passed!**
 
 ---
@@ -278,9 +282,9 @@ mod tests {
 
 Before submitting a PR, confirm all of the following:
 
-- [ ] `cargo fmt --all --check` passes (**required**)
-- [ ] `cargo clippy --workspace -- -D warnings` passes (**required, zero warnings**)
-- [ ] `cargo test --workspace` passes (**required, all must pass**)
+- [ ] `cargo fmt --all --check` passes (**required unless the change is markdown-only non-code**)
+- [ ] `cargo clippy --workspace -- -D warnings` passes (**required unless the change is markdown-only non-code**)
+- [ ] `cargo test --workspace` passes (**required unless the change is markdown-only non-code**)
 - [ ] No changes to CLI/JSON/config contracts (or followed Breaking Change process)
 - [ ] New behaviors have unit tests
 - [ ] Each new command has at least 2 exit code test scenarios
