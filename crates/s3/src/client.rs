@@ -23,6 +23,13 @@ use tokio::io::AsyncReadExt;
 /// streaming aws-chunked payloads.
 const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = crate::multipart::DEFAULT_PART_SIZE;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BucketPolicyErrorKind {
+    MissingPolicy,
+    MissingBucket,
+    Other,
+}
+
 /// Custom HTTP connector using reqwest, supporting insecure TLS (skip cert verification)
 /// and custom CA bundles. Used when `alias.insecure = true` or `alias.ca_bundle.is_some()`.
 #[derive(Debug, Clone)]
@@ -252,6 +259,68 @@ impl S3Client {
 
     fn should_use_multipart(file_size: u64) -> bool {
         file_size > SINGLE_PUT_OBJECT_MAX_SIZE
+    }
+
+    fn bucket_policy_error_kind(
+        error_code: Option<&str>,
+        status_code: Option<u16>,
+        error_text: &str,
+    ) -> BucketPolicyErrorKind {
+        let error_code = error_code.map(|code| code.to_ascii_lowercase());
+        if matches!(
+            error_code.as_deref(),
+            Some("nosuchbucketpolicy") | Some("nosuchpolicy")
+        ) {
+            return BucketPolicyErrorKind::MissingPolicy;
+        }
+        if matches!(error_code.as_deref(), Some("nosuchbucket")) {
+            return BucketPolicyErrorKind::MissingBucket;
+        }
+
+        let error_text = error_text.to_ascii_lowercase();
+        if error_text.contains("nosuchbucketpolicy") || error_text.contains("nosuchpolicy") {
+            return BucketPolicyErrorKind::MissingPolicy;
+        }
+        if error_text.contains("nosuchbucket") {
+            return BucketPolicyErrorKind::MissingBucket;
+        }
+        if status_code == Some(404) {
+            return BucketPolicyErrorKind::MissingPolicy;
+        }
+
+        BucketPolicyErrorKind::Other
+    }
+
+    fn map_get_bucket_policy_error(
+        bucket: &str,
+        kind: BucketPolicyErrorKind,
+        error_text: &str,
+    ) -> Result<Option<String>> {
+        match kind {
+            BucketPolicyErrorKind::MissingPolicy => Ok(None),
+            BucketPolicyErrorKind::MissingBucket => {
+                Err(Error::NotFound(format!("Bucket not found: {bucket}")))
+            }
+            BucketPolicyErrorKind::Other => {
+                Err(Error::Network(format!("get_bucket_policy: {error_text}")))
+            }
+        }
+    }
+
+    fn map_delete_bucket_policy_error(
+        bucket: &str,
+        kind: BucketPolicyErrorKind,
+        error_text: &str,
+    ) -> Result<()> {
+        match kind {
+            BucketPolicyErrorKind::MissingPolicy => Ok(()),
+            BucketPolicyErrorKind::MissingBucket => {
+                Err(Error::NotFound(format!("Bucket not found: {bucket}")))
+            }
+            BucketPolicyErrorKind::Other => Err(Error::General(format!(
+                "delete_bucket_policy: {error_text}"
+            ))),
+        }
     }
 
     async fn read_next_part(
@@ -725,6 +794,7 @@ impl ObjectStore for S3Client {
             versioning: true,
             object_lock: false,
             tagging: true,
+            anonymous: true,
             select: false,
             notifications: false,
         })
@@ -1147,6 +1217,68 @@ impl ObjectStore for S3Client {
 
         Ok(())
     }
+
+    async fn get_bucket_policy(&self, bucket: &str) -> Result<Option<String>> {
+        let response = match self.inner.get_bucket_policy().bucket(bucket).send().await {
+            Ok(policy) => policy,
+            Err(error) => {
+                let error_text = error.to_string();
+                let kind = if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &error {
+                    let code = service_err
+                        .raw()
+                        .headers()
+                        .get("x-amz-error-code")
+                        .and_then(|value| std::str::from_utf8(value.as_bytes()).ok());
+                    let status = Some(service_err.raw().status().as_u16());
+                    Self::bucket_policy_error_kind(code, status, &error_text)
+                } else {
+                    Self::bucket_policy_error_kind(None, None, &error_text)
+                };
+                return Self::map_get_bucket_policy_error(bucket, kind, &error_text);
+            }
+        };
+
+        Ok(response.policy().map(|policy| policy.to_string()))
+    }
+
+    async fn set_bucket_policy(&self, bucket: &str, policy: &str) -> Result<()> {
+        self.inner
+            .put_bucket_policy()
+            .bucket(bucket)
+            .policy(policy)
+            .send()
+            .await
+            .map_err(|e| Error::General(format!("set_bucket_policy: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn delete_bucket_policy(&self, bucket: &str) -> Result<()> {
+        match self
+            .inner
+            .delete_bucket_policy()
+            .bucket(bucket)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let error_text = e.to_string();
+                let kind = if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &e {
+                    let code = service_err
+                        .raw()
+                        .headers()
+                        .get("x-amz-error-code")
+                        .and_then(|value| std::str::from_utf8(value.as_bytes()).ok());
+                    let status = Some(service_err.raw().status().as_u16());
+                    Self::bucket_policy_error_kind(code, status, &error_text)
+                } else {
+                    Self::bucket_policy_error_kind(None, None, &error_text)
+                };
+                Self::map_delete_bucket_policy_error(bucket, kind, &error_text)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1158,6 +1290,60 @@ mod tests {
         let info = ObjectInfo::file("test.txt", 1024);
         assert_eq!(info.key, "test.txt");
         assert_eq!(info.size_bytes, Some(1024));
+    }
+
+    #[test]
+    fn bucket_policy_error_kind_uses_error_code() {
+        assert_eq!(
+            S3Client::bucket_policy_error_kind(Some("NoSuchBucketPolicy"), Some(404), ""),
+            BucketPolicyErrorKind::MissingPolicy
+        );
+        assert_eq!(
+            S3Client::bucket_policy_error_kind(Some("NoSuchBucket"), Some(404), ""),
+            BucketPolicyErrorKind::MissingBucket
+        );
+    }
+
+    #[test]
+    fn bucket_policy_error_kind_prefers_bucket_not_found_over_404_fallback() {
+        assert_eq!(
+            S3Client::bucket_policy_error_kind(None, Some(404), "NoSuchBucket"),
+            BucketPolicyErrorKind::MissingBucket
+        );
+        assert_eq!(
+            S3Client::bucket_policy_error_kind(None, Some(404), "no details"),
+            BucketPolicyErrorKind::MissingPolicy
+        );
+    }
+
+    #[test]
+    fn bucket_policy_error_mapping_returns_expected_result() {
+        let get_missing_policy = S3Client::map_get_bucket_policy_error(
+            "bucket",
+            BucketPolicyErrorKind::MissingPolicy,
+            "NoSuchPolicy",
+        )
+        .expect("missing policy should map to Ok(None)");
+        assert!(get_missing_policy.is_none());
+
+        match S3Client::map_get_bucket_policy_error(
+            "bucket",
+            BucketPolicyErrorKind::MissingBucket,
+            "NoSuchBucket",
+        ) {
+            Err(Error::NotFound(message)) => assert!(message.contains("Bucket not found")),
+            other => panic!("Expected NotFound for missing bucket, got: {:?}", other),
+        }
+
+        let delete_missing_policy = S3Client::map_delete_bucket_policy_error(
+            "bucket",
+            BucketPolicyErrorKind::MissingPolicy,
+            "NoSuchPolicy",
+        );
+        assert!(
+            delete_missing_policy.is_ok(),
+            "Missing policy should be treated as successful delete"
+        );
     }
 
     #[tokio::test]
