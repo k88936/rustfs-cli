@@ -104,6 +104,12 @@ rc mirror local/bucket1/ local/bucket2/
 # Find objects
 rc find local/bucket --name "*.txt" --newer 1d
 
+# List anonymous access rules
+rc anonymous list local/bucket
+
+# Set anonymous access level
+rc anonymous set public local/bucket/public
+
 # Generate download link
 rc share download local/bucket/file.txt --expire 24h
 
@@ -165,6 +171,7 @@ rc admin heal status local --json
 | `head` | Display first N lines of object |
 | `stat` | Display object metadata |
 | `find` | Find objects |
+| `anonymous` | Manage anonymous access to buckets and objects |
 | `diff` | Compare two locations |
 | `mirror` | Mirror sync between S3 locations |
 | `tree` | Tree view display |
