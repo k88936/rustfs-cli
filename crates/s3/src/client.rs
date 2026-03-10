@@ -14,8 +14,8 @@ use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use jiff::Timestamp;
 use rc_core::{
-    Alias, Capabilities, Error, ListOptions, ListResult, ObjectInfo, ObjectStore, ObjectVersion,
-    RemotePath, Result,
+    Alias, BucketNotification, Capabilities, Error, ListOptions, ListResult, NotificationTarget,
+    ObjectInfo, ObjectStore, ObjectVersion, RemotePath, Result,
 };
 use tokio::io::AsyncReadExt;
 
@@ -321,6 +321,114 @@ impl S3Client {
                 "delete_bucket_policy: {error_text}"
             ))),
         }
+    }
+
+    fn extract_notification_filter(
+        filter: Option<&aws_sdk_s3::types::NotificationConfigurationFilter>,
+    ) -> (Option<String>, Option<String>) {
+        let mut prefix = None;
+        let mut suffix = None;
+
+        if let Some(key_filter) = filter.and_then(|value| value.key()) {
+            for rule in key_filter.filter_rules() {
+                match rule.name().map(|name| name.as_str()) {
+                    Some("prefix") => {
+                        prefix = rule.value().map(ToString::to_string);
+                    }
+                    Some("suffix") => {
+                        suffix = rule.value().map(ToString::to_string);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        (prefix, suffix)
+    }
+
+    fn build_notification_filter(
+        prefix: Option<&str>,
+        suffix: Option<&str>,
+    ) -> Option<aws_sdk_s3::types::NotificationConfigurationFilter> {
+        use aws_sdk_s3::types::{FilterRule, FilterRuleName, NotificationConfigurationFilter};
+
+        let mut rules = Vec::new();
+        if let Some(value) = prefix {
+            let rule = FilterRule::builder()
+                .name(FilterRuleName::Prefix)
+                .value(value)
+                .build();
+            rules.push(rule);
+        }
+        if let Some(value) = suffix {
+            let rule = FilterRule::builder()
+                .name(FilterRuleName::Suffix)
+                .value(value)
+                .build();
+            rules.push(rule);
+        }
+        if rules.is_empty() {
+            return None;
+        }
+
+        let key_filter = aws_sdk_s3::types::S3KeyFilter::builder()
+            .set_filter_rules(Some(rules))
+            .build();
+        NotificationConfigurationFilter::builder()
+            .key(key_filter)
+            .build()
+            .into()
+    }
+
+    fn event_list_to_strings(events: &[aws_sdk_s3::types::Event]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| event.as_str().to_string())
+            .collect()
+    }
+
+    fn strings_to_event_list(events: &[String]) -> Vec<aws_sdk_s3::types::Event> {
+        events
+            .iter()
+            .map(|event| aws_sdk_s3::types::Event::from(event.as_str()))
+            .collect()
+    }
+
+    fn notifications_equivalent(
+        expected: &[BucketNotification],
+        actual: &[BucketNotification],
+    ) -> bool {
+        type CanonicalEntry = (u8, String, Option<String>, Option<String>, Vec<String>);
+
+        fn target_order(target: NotificationTarget) -> u8 {
+            match target {
+                NotificationTarget::Queue => 0,
+                NotificationTarget::Topic => 1,
+                NotificationTarget::Lambda => 2,
+            }
+        }
+
+        fn canonical(notifications: &[BucketNotification]) -> Vec<CanonicalEntry> {
+            let mut normalized: Vec<CanonicalEntry> = notifications
+                .iter()
+                .map(|item| {
+                    let mut events = item.events.clone();
+                    events.sort();
+                    events.dedup();
+                    (
+                        target_order(item.target),
+                        item.arn.clone(),
+                        item.prefix.clone(),
+                        item.suffix.clone(),
+                        events,
+                    )
+                })
+                .collect();
+            normalized.sort();
+            normalized
+        }
+
+        canonical(expected) == canonical(actual)
     }
 
     async fn read_next_part(
@@ -788,15 +896,15 @@ impl ObjectStore for S3Client {
     }
 
     async fn capabilities(&self) -> Result<Capabilities> {
-        // For now, return conservative defaults
-        // In Phase 5, we'll implement actual capability detection
+        // Hardcoded optimistic defaults for common S3-compatible backends.
+        // In a future phase we can replace these with active detection.
         Ok(Capabilities {
             versioning: true,
             object_lock: false,
             tagging: true,
             anonymous: true,
             select: false,
-            notifications: false,
+            notifications: true,
         })
     }
 
@@ -1279,6 +1387,160 @@ impl ObjectStore for S3Client {
             }
         }
     }
+
+    async fn get_bucket_notifications(&self, bucket: &str) -> Result<Vec<BucketNotification>> {
+        let response = self
+            .inner
+            .get_bucket_notification_configuration()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|e| Error::General(format!("get_bucket_notifications: {e}")))?;
+
+        let mut rules = Vec::new();
+
+        for cfg in response.queue_configurations() {
+            let (prefix, suffix) = Self::extract_notification_filter(cfg.filter());
+            rules.push(BucketNotification {
+                id: cfg.id().map(ToString::to_string),
+                target: NotificationTarget::Queue,
+                arn: cfg.queue_arn().to_string(),
+                events: Self::event_list_to_strings(cfg.events()),
+                prefix,
+                suffix,
+            });
+        }
+
+        for cfg in response.topic_configurations() {
+            let (prefix, suffix) = Self::extract_notification_filter(cfg.filter());
+            rules.push(BucketNotification {
+                id: cfg.id().map(ToString::to_string),
+                target: NotificationTarget::Topic,
+                arn: cfg.topic_arn().to_string(),
+                events: Self::event_list_to_strings(cfg.events()),
+                prefix,
+                suffix,
+            });
+        }
+
+        for cfg in response.lambda_function_configurations() {
+            let (prefix, suffix) = Self::extract_notification_filter(cfg.filter());
+            rules.push(BucketNotification {
+                id: cfg.id().map(ToString::to_string),
+                target: NotificationTarget::Lambda,
+                arn: cfg.lambda_function_arn().to_string(),
+                events: Self::event_list_to_strings(cfg.events()),
+                prefix,
+                suffix,
+            });
+        }
+
+        Ok(rules)
+    }
+
+    async fn set_bucket_notifications(
+        &self,
+        bucket: &str,
+        notifications: Vec<BucketNotification>,
+    ) -> Result<()> {
+        use aws_sdk_s3::types::{
+            LambdaFunctionConfiguration, NotificationConfiguration, QueueConfiguration,
+            TopicConfiguration,
+        };
+
+        let expected_notifications = notifications.clone();
+        let mut queues = Vec::new();
+        let mut topics = Vec::new();
+        let mut lambdas = Vec::new();
+
+        for rule in notifications {
+            let events = Self::strings_to_event_list(&rule.events);
+            if events.is_empty() {
+                return Err(Error::General(format!(
+                    "set_bucket_notifications: empty event list for target '{}'",
+                    rule.arn
+                )));
+            }
+
+            let filter =
+                Self::build_notification_filter(rule.prefix.as_deref(), rule.suffix.as_deref());
+
+            match rule.target {
+                NotificationTarget::Queue => {
+                    let mut builder = QueueConfiguration::builder()
+                        .queue_arn(rule.arn)
+                        .set_events(Some(events))
+                        .set_id(rule.id);
+                    if let Some(filter) = filter {
+                        builder = builder.filter(filter);
+                    }
+                    let queue = builder
+                        .build()
+                        .map_err(|e| Error::General(format!("build queue notification: {e}")))?;
+                    queues.push(queue);
+                }
+                NotificationTarget::Topic => {
+                    let mut builder = TopicConfiguration::builder()
+                        .topic_arn(rule.arn)
+                        .set_events(Some(events))
+                        .set_id(rule.id);
+                    if let Some(filter) = filter {
+                        builder = builder.filter(filter);
+                    }
+                    let topic = builder
+                        .build()
+                        .map_err(|e| Error::General(format!("build topic notification: {e}")))?;
+                    topics.push(topic);
+                }
+                NotificationTarget::Lambda => {
+                    let mut builder = LambdaFunctionConfiguration::builder()
+                        .lambda_function_arn(rule.arn)
+                        .set_events(Some(events))
+                        .set_id(rule.id);
+                    if let Some(filter) = filter {
+                        builder = builder.filter(filter);
+                    }
+                    let lambda = builder
+                        .build()
+                        .map_err(|e| Error::General(format!("build lambda notification: {e}")))?;
+                    lambdas.push(lambda);
+                }
+            }
+        }
+
+        let config = NotificationConfiguration::builder()
+            .set_queue_configurations(Some(queues))
+            .set_topic_configurations(Some(topics))
+            .set_lambda_function_configurations(Some(lambdas))
+            .build();
+
+        match self
+            .inner
+            .put_bucket_notification_configuration()
+            .bucket(bucket)
+            .notification_configuration(config)
+            .send()
+            .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                let error_text = error.to_string();
+                // RustFS may apply notification configuration but still return a non-AWS
+                // response envelope that the SDK reports as "service error".
+                if error_text.contains("service error")
+                    && let Ok(actual) = self.get_bucket_notifications(bucket).await
+                    && Self::notifications_equivalent(&expected_notifications, &actual)
+                {
+                    return Ok(());
+                }
+                return Err(Error::General(format!(
+                    "set_bucket_notifications: {error_text}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1344,6 +1606,66 @@ mod tests {
             delete_missing_policy.is_ok(),
             "Missing policy should be treated as successful delete"
         );
+    }
+
+    #[test]
+    fn notification_filter_round_trip_prefix_and_suffix() {
+        let filter = S3Client::build_notification_filter(Some("logs/"), Some(".json"))
+            .expect("filter should be built");
+        let (prefix, suffix) = S3Client::extract_notification_filter(Some(&filter));
+        assert_eq!(prefix.as_deref(), Some("logs/"));
+        assert_eq!(suffix.as_deref(), Some(".json"));
+    }
+
+    #[test]
+    fn notification_filter_none_when_empty() {
+        assert!(S3Client::build_notification_filter(None, None).is_none());
+    }
+
+    #[test]
+    fn notifications_equivalent_ignores_order_and_duplicate_events() {
+        let expected = vec![
+            BucketNotification {
+                id: Some("a".to_string()),
+                target: NotificationTarget::Queue,
+                arn: "arn:aws:sqs:us-east-1:123456789012:q".to_string(),
+                events: vec![
+                    "s3:ObjectCreated:*".to_string(),
+                    "s3:ObjectCreated:*".to_string(),
+                ],
+                prefix: Some("images/".to_string()),
+                suffix: Some(".jpg".to_string()),
+            },
+            BucketNotification {
+                id: Some("b".to_string()),
+                target: NotificationTarget::Topic,
+                arn: "arn:aws:sns:us-east-1:123456789012:t".to_string(),
+                events: vec!["s3:ObjectRemoved:*".to_string()],
+                prefix: None,
+                suffix: None,
+            },
+        ];
+
+        let actual = vec![
+            BucketNotification {
+                id: None,
+                target: NotificationTarget::Topic,
+                arn: "arn:aws:sns:us-east-1:123456789012:t".to_string(),
+                events: vec!["s3:ObjectRemoved:*".to_string()],
+                prefix: None,
+                suffix: None,
+            },
+            BucketNotification {
+                id: None,
+                target: NotificationTarget::Queue,
+                arn: "arn:aws:sqs:us-east-1:123456789012:q".to_string(),
+                events: vec!["s3:ObjectCreated:*".to_string()],
+                prefix: Some("images/".to_string()),
+                suffix: Some(".jpg".to_string()),
+            },
+        ];
+
+        assert!(S3Client::notifications_equivalent(&expected, &actual));
     }
 
     #[tokio::test]
