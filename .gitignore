@@ -6,6 +6,7 @@
 .idea/
 .vscode/
 .cursor/
+.claude/
 *.swp
 *.swo
 *~
@@ -24,4 +25,4 @@ coverage/
 
 # Cargo lock for library crates (keep for binary)
 # Cargo.lock
-
+CLAUDE.md

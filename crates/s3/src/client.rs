@@ -3,6 +3,11 @@
 //! Wraps aws-sdk-s3 and implements the ObjectStore trait from rc-core.
 
 use async_trait::async_trait;
+use aws_credential_types::Credentials;
+use aws_sigv4::http_request::{
+    SignableBody, SignableRequest, SignatureLocation, SigningSettings, sign,
+};
+use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::http::{
     HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpConnector,
 };
@@ -13,15 +18,24 @@ use aws_smithy_runtime_api::http::{Response, StatusCode};
 use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use jiff::Timestamp;
+use quick_xml::de::from_str as from_xml_str;
 use rc_core::{
-    Alias, BucketNotification, Capabilities, Error, ListOptions, ListResult, NotificationTarget,
-    ObjectInfo, ObjectStore, ObjectVersion, RemotePath, Result,
+    Alias, BucketNotification, Capabilities, Error, LifecycleRule, ListOptions, ListResult,
+    NotificationTarget, ObjectInfo, ObjectStore, ObjectVersion, RemotePath,
+    ReplicationConfiguration, Result,
 };
+use reqwest::Method;
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use tokio::io::AsyncReadExt;
 
 /// Keep single-part uploads small to avoid backend incompatibilities with
 /// streaming aws-chunked payloads.
 const SINGLE_PUT_OBJECT_MAX_SIZE: u64 = crate::multipart::DEFAULT_PART_SIZE;
+const S3_SERVICE_NAME: &str = "s3";
+const S3_REPLICATION_XML_NAMESPACE: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BucketPolicyErrorKind {
@@ -39,26 +53,395 @@ struct ReqwestConnector {
 
 impl ReqwestConnector {
     async fn new(insecure: bool, ca_bundle: Option<&str>) -> Result<Self> {
-        // NOTE: When `insecure = true`, `danger_accept_invalid_certs` disables all TLS
-        // certificate verification. Any CA bundle provided will still be added to the
-        // trust store but is rendered ineffective for this connection.
-        let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(insecure);
-
-        if let Some(bundle_path) = ca_bundle {
-            // Use tokio::fs::read to avoid blocking the async runtime thread.
-            let pem = tokio::fs::read(bundle_path).await.map_err(|e| {
-                Error::Network(format!("Failed to read CA bundle '{bundle_path}': {e}"))
-            })?;
-            let cert = reqwest::Certificate::from_pem(&pem)
-                .map_err(|e| Error::Network(format!("Invalid CA bundle '{bundle_path}': {e}")))?;
-            builder = builder.add_root_certificate(cert);
-        }
-
-        let client = builder
-            .build()
-            .map_err(|e| Error::Network(format!("Failed to build HTTP client: {e}")))?;
+        let client = build_reqwest_client(insecure, ca_bundle).await?;
         Ok(Self { client })
     }
+}
+
+async fn build_reqwest_client(insecure: bool, ca_bundle: Option<&str>) -> Result<reqwest::Client> {
+    // NOTE: When `insecure = true`, `danger_accept_invalid_certs` disables all TLS
+    // certificate verification. Any CA bundle provided will still be added to the
+    // trust store but is rendered ineffective for this connection.
+    let mut builder = reqwest::Client::builder().danger_accept_invalid_certs(insecure);
+
+    if let Some(bundle_path) = ca_bundle {
+        // Use tokio::fs::read to avoid blocking the async runtime thread.
+        let pem = tokio::fs::read(bundle_path).await.map_err(|e| {
+            Error::Network(format!("Failed to read CA bundle '{bundle_path}': {e}"))
+        })?;
+        let cert = reqwest::Certificate::from_pem(&pem)
+            .map_err(|e| Error::Network(format!("Invalid CA bundle '{bundle_path}': {e}")))?;
+        builder = builder.add_root_certificate(cert);
+    }
+
+    let client = builder
+        .build()
+        .map_err(|e| Error::Network(format!("Failed to build HTTP client: {e}")))?;
+    Ok(client)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplicationConfigurationXml {
+    role: Option<String>,
+    #[serde(rename = "Rule", default)]
+    rules: Vec<ReplicationRuleXml>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplicationRuleXml {
+    #[serde(rename = "ID")]
+    id: Option<String>,
+    priority: Option<i32>,
+    status: Option<String>,
+    #[serde(rename = "Prefix")]
+    legacy_prefix: Option<String>,
+    filter: Option<ReplicationFilterXml>,
+    destination: Option<ReplicationDestinationXml>,
+    delete_marker_replication: Option<ReplicationStatusXml>,
+    existing_object_replication: Option<ReplicationStatusXml>,
+    delete_replication: Option<ReplicationStatusXml>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplicationFilterXml {
+    prefix: Option<String>,
+    tag: Option<TagXml>,
+    and: Option<ReplicationAndXml>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplicationAndXml {
+    prefix: Option<String>,
+    #[serde(rename = "Tag", default)]
+    tags: Vec<TagXml>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct TagXml {
+    key: Option<String>,
+    value: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplicationDestinationXml {
+    bucket: Option<String>,
+    storage_class: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ReplicationStatusXml {
+    status: Option<String>,
+}
+
+fn parse_replication_status(status: Option<&ReplicationStatusXml>) -> Option<bool> {
+    status
+        .and_then(|value| value.status.as_deref())
+        .map(|value| value.eq_ignore_ascii_case("enabled"))
+}
+
+fn parse_replication_rule_status(status: Option<&str>) -> rc_core::ReplicationRuleStatus {
+    match status {
+        Some(value) if value.eq_ignore_ascii_case("enabled") => {
+            rc_core::ReplicationRuleStatus::Enabled
+        }
+        _ => rc_core::ReplicationRuleStatus::Disabled,
+    }
+}
+
+fn collect_tag_map<'a, I>(tags: I) -> Option<HashMap<String, String>>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let collected: HashMap<String, String> = tags
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    if collected.is_empty() {
+        None
+    } else {
+        Some(collected)
+    }
+}
+
+fn parse_tag_xml(tag: Option<&TagXml>) -> Option<HashMap<String, String>> {
+    collect_tag_map(tag.and_then(|tag| Some((tag.key.as_deref()?, tag.value.as_deref()?))))
+}
+
+fn parse_tag_xmls(tags: &[TagXml]) -> Option<HashMap<String, String>> {
+    collect_tag_map(
+        tags.iter()
+            .filter_map(|tag| Some((tag.key.as_deref()?, tag.value.as_deref()?))),
+    )
+}
+
+fn parse_replication_filter_prefix(filter: Option<&ReplicationFilterXml>) -> Option<String> {
+    filter
+        .and_then(|filter| filter.prefix.clone())
+        .or_else(|| filter.and_then(|filter| filter.and.as_ref()?.prefix.clone()))
+}
+
+fn parse_replication_filter_tags(
+    filter: Option<&ReplicationFilterXml>,
+) -> Option<HashMap<String, String>> {
+    filter
+        .and_then(|filter| parse_tag_xml(filter.tag.as_ref()))
+        .or_else(|| filter.and_then(|filter| parse_tag_xmls(&filter.and.as_ref()?.tags)))
+}
+
+fn sorted_tags(tags: &HashMap<String, String>) -> Vec<(&str, &str)> {
+    let mut pairs: Vec<(&str, &str)> = tags
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    pairs.sort_unstable();
+    pairs
+}
+
+fn append_tag_xml(xml: &mut String, key: &str, value: &str) {
+    xml.push_str("<Tag><Key>");
+    xml.push_str(&xml_escape(key));
+    xml.push_str("</Key><Value>");
+    xml.push_str(&xml_escape(value));
+    xml.push_str("</Value></Tag>");
+}
+
+fn append_replication_filter_xml(
+    xml: &mut String,
+    prefix: Option<&str>,
+    tags: Option<&HashMap<String, String>>,
+) {
+    let Some(tags) = tags.filter(|tags| !tags.is_empty()) else {
+        if let Some(prefix) = prefix {
+            xml.push_str("<Filter><Prefix>");
+            xml.push_str(&xml_escape(prefix));
+            xml.push_str("</Prefix></Filter>");
+        }
+        return;
+    };
+
+    xml.push_str("<Filter>");
+    if prefix.is_some() || tags.len() > 1 {
+        xml.push_str("<And>");
+        if let Some(prefix) = prefix {
+            xml.push_str("<Prefix>");
+            xml.push_str(&xml_escape(prefix));
+            xml.push_str("</Prefix>");
+        }
+        for (key, value) in sorted_tags(tags) {
+            append_tag_xml(xml, key, value);
+        }
+        xml.push_str("</And>");
+    } else if let Some((key, value)) = sorted_tags(tags).into_iter().next() {
+        append_tag_xml(xml, key, value);
+    }
+    xml.push_str("</Filter>");
+}
+
+fn parse_replication_configuration_xml(body: &str) -> Result<ReplicationConfiguration> {
+    let config: ReplicationConfigurationXml = from_xml_str(body)
+        .map_err(|e| Error::General(format!("parse replication config xml: {e}")))?;
+
+    let rules = config
+        .rules
+        .into_iter()
+        .map(|rule| rc_core::ReplicationRule {
+            id: rule.id.unwrap_or_default(),
+            priority: rule.priority.unwrap_or_default(),
+            status: parse_replication_rule_status(rule.status.as_deref()),
+            prefix: parse_replication_filter_prefix(rule.filter.as_ref()).or(rule.legacy_prefix),
+            tags: parse_replication_filter_tags(rule.filter.as_ref()),
+            destination: rc_core::ReplicationDestination {
+                bucket_arn: rule
+                    .destination
+                    .as_ref()
+                    .and_then(|destination| destination.bucket.clone())
+                    .unwrap_or_default(),
+                storage_class: rule
+                    .destination
+                    .and_then(|destination| destination.storage_class),
+            },
+            delete_marker_replication: parse_replication_status(
+                rule.delete_marker_replication.as_ref(),
+            ),
+            existing_object_replication: parse_replication_status(
+                rule.existing_object_replication.as_ref(),
+            ),
+            delete_replication: parse_replication_status(rule.delete_replication.as_ref()),
+        })
+        .collect();
+
+    Ok(ReplicationConfiguration {
+        role: config.role.unwrap_or_default(),
+        rules,
+    })
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn append_replication_status_tag(xml: &mut String, tag: &str, enabled: Option<bool>) {
+    if let Some(enabled) = enabled {
+        let status = if enabled { "Enabled" } else { "Disabled" };
+        xml.push('<');
+        xml.push_str(tag);
+        xml.push_str("><Status>");
+        xml.push_str(status);
+        xml.push_str("</Status></");
+        xml.push_str(tag);
+        xml.push('>');
+    }
+}
+
+fn build_replication_configuration_xml(config: &ReplicationConfiguration) -> String {
+    let mut xml = String::from(r#"<?xml version="1.0" encoding="UTF-8"?>"#);
+    xml.push_str(r#"<ReplicationConfiguration xmlns=""#);
+    xml.push_str(S3_REPLICATION_XML_NAMESPACE);
+    xml.push_str(r#"">"#);
+
+    if !config.role.is_empty() {
+        xml.push_str("<Role>");
+        xml.push_str(&xml_escape(&config.role));
+        xml.push_str("</Role>");
+    }
+
+    for rule in &config.rules {
+        xml.push_str("<Rule>");
+
+        xml.push_str("<Status>");
+        xml.push_str(match rule.status {
+            rc_core::ReplicationRuleStatus::Enabled => "Enabled",
+            rc_core::ReplicationRuleStatus::Disabled => "Disabled",
+        });
+        xml.push_str("</Status>");
+
+        xml.push_str("<Destination><Bucket>");
+        xml.push_str(&xml_escape(&rule.destination.bucket_arn));
+        xml.push_str("</Bucket>");
+        if let Some(storage_class) = &rule.destination.storage_class {
+            xml.push_str("<StorageClass>");
+            xml.push_str(&xml_escape(storage_class));
+            xml.push_str("</StorageClass>");
+        }
+        xml.push_str("</Destination>");
+
+        if !rule.id.is_empty() {
+            xml.push_str("<ID>");
+            xml.push_str(&xml_escape(&rule.id));
+            xml.push_str("</ID>");
+        }
+
+        xml.push_str("<Priority>");
+        xml.push_str(&rule.priority.to_string());
+        xml.push_str("</Priority>");
+
+        append_replication_filter_xml(&mut xml, rule.prefix.as_deref(), rule.tags.as_ref());
+
+        append_replication_status_tag(
+            &mut xml,
+            "ExistingObjectReplication",
+            rule.existing_object_replication,
+        );
+        append_replication_status_tag(
+            &mut xml,
+            "DeleteMarkerReplication",
+            rule.delete_marker_replication,
+        );
+        append_replication_status_tag(&mut xml, "DeleteReplication", rule.delete_replication);
+
+        xml.push_str("</Rule>");
+    }
+
+    xml.push_str("</ReplicationConfiguration>");
+    xml
+}
+
+fn parse_lifecycle_filter_prefix(
+    filter: Option<&aws_sdk_s3::types::LifecycleRuleFilter>,
+) -> Option<String> {
+    filter
+        .and_then(|filter| filter.prefix().map(str::to_string))
+        .or_else(|| filter.and_then(|filter| filter.and()?.prefix().map(str::to_string)))
+}
+
+fn parse_lifecycle_filter_tags(
+    filter: Option<&aws_sdk_s3::types::LifecycleRuleFilter>,
+) -> Option<HashMap<String, String>> {
+    filter
+        .and_then(|filter| collect_tag_map(filter.tag().map(|tag| (tag.key(), tag.value()))))
+        .or_else(|| {
+            filter.and_then(|filter| {
+                collect_tag_map(
+                    filter
+                        .and()?
+                        .tags()
+                        .iter()
+                        .map(|tag| (tag.key(), tag.value())),
+                )
+            })
+        })
+}
+
+fn build_s3_tag(key: &str, value: &str) -> Result<aws_sdk_s3::types::Tag> {
+    aws_sdk_s3::types::Tag::builder()
+        .key(key)
+        .value(value)
+        .build()
+        .map_err(|error| Error::General(format!("build filter tag: {error}")))
+}
+
+fn build_lifecycle_rule_filter(
+    prefix: Option<&str>,
+    tags: Option<&HashMap<String, String>>,
+) -> Result<Option<aws_sdk_s3::types::LifecycleRuleFilter>> {
+    let Some(tags) = tags.filter(|tags| !tags.is_empty()) else {
+        return Ok(prefix.map(|prefix| {
+            aws_sdk_s3::types::LifecycleRuleFilter::builder()
+                .prefix(prefix)
+                .build()
+        }));
+    };
+
+    let tag_values = sorted_tags(tags)
+        .into_iter()
+        .map(|(key, value)| build_s3_tag(key, value))
+        .collect::<Result<Vec<_>>>()?;
+
+    let filter = if prefix.is_some() || tag_values.len() > 1 {
+        let mut and_builder = aws_sdk_s3::types::LifecycleRuleAndOperator::builder();
+        if let Some(prefix) = prefix {
+            and_builder = and_builder.prefix(prefix);
+        }
+        for tag in tag_values {
+            and_builder = and_builder.tags(tag);
+        }
+        aws_sdk_s3::types::LifecycleRuleFilter::builder()
+            .and(and_builder.build())
+            .build()
+    } else {
+        aws_sdk_s3::types::LifecycleRuleFilter::builder()
+            .tag(
+                tag_values
+                    .into_iter()
+                    .next()
+                    .expect("non-empty tags required to build lifecycle filter"),
+            )
+            .build()
+    };
+
+    Ok(Some(filter))
 }
 
 impl HttpConnector for ReqwestConnector {
@@ -165,6 +548,7 @@ impl HttpClient for ReqwestConnector {
 /// S3 client wrapper
 pub struct S3Client {
     inner: aws_sdk_s3::Client,
+    xml_http_client: reqwest::Client,
     #[allow(dead_code)]
     alias: Alias,
 }
@@ -200,6 +584,8 @@ impl S3Client {
             config_loader = config_loader.http_client(connector);
         }
 
+        let xml_http_client =
+            build_reqwest_client(alias.insecure, alias.ca_bundle.as_deref()).await?;
         let config = config_loader.load().await;
 
         // Build S3 client with path-style addressing for compatibility
@@ -219,6 +605,7 @@ impl S3Client {
 
         Ok(Self {
             inner: client,
+            xml_http_client,
             alias,
         })
     }
@@ -259,6 +646,162 @@ impl S3Client {
 
     fn should_use_multipart(file_size: u64) -> bool {
         file_size > SINGLE_PUT_OBJECT_MAX_SIZE
+    }
+
+    fn sha256_hash(body: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(body);
+        hex::encode(hasher.finalize())
+    }
+
+    fn request_host(&self, url: &reqwest::Url) -> Result<String> {
+        let host = url
+            .host_str()
+            .ok_or_else(|| Error::Network("Missing host in request URL".to_string()))?;
+        Ok(match url.port() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.to_string(),
+        })
+    }
+
+    fn replication_url(&self, bucket: &str) -> Result<reqwest::Url> {
+        let mut url =
+            reqwest::Url::parse(self.alias.endpoint.trim_end_matches('/')).map_err(|e| {
+                Error::Network(format!("Invalid endpoint '{}': {e}", self.alias.endpoint))
+            })?;
+
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                Error::Network(format!(
+                    "Endpoint '{}' does not support path-style bucket operations",
+                    self.alias.endpoint
+                ))
+            })?;
+            segments.pop_if_empty();
+            segments.push(bucket);
+        }
+
+        url.set_query(Some("replication="));
+        Ok(url)
+    }
+
+    async fn sign_xml_request(
+        &self,
+        method: &Method,
+        url: &str,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<HeaderMap> {
+        let credentials = Credentials::new(
+            &self.alias.access_key,
+            &self.alias.secret_key,
+            None,
+            None,
+            "s3-xml-client",
+        );
+
+        let identity = credentials.into();
+        let mut signing_settings = SigningSettings::default();
+        signing_settings.signature_location = SignatureLocation::Headers;
+
+        let signing_params = v4::SigningParams::builder()
+            .identity(&identity)
+            .region(&self.alias.region)
+            .name(S3_SERVICE_NAME)
+            .time(std::time::SystemTime::now())
+            .settings(signing_settings)
+            .build()
+            .map_err(|e| Error::Auth(format!("Failed to build signing params: {e}")))?;
+
+        let header_pairs: Vec<(&str, &str)> = headers
+            .iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|v| (k.as_str(), v)))
+            .collect();
+
+        let signable_request = SignableRequest::new(
+            method.as_str(),
+            url,
+            header_pairs.into_iter(),
+            SignableBody::Bytes(body),
+        )
+        .map_err(|e| Error::Auth(format!("Failed to create signable request: {e}")))?;
+
+        let (signing_instructions, _) = sign(signable_request, &signing_params.into())
+            .map_err(|e| Error::Auth(format!("Failed to sign request: {e}")))?
+            .into_parts();
+
+        let mut signed_headers = headers.clone();
+        for (name, value) in signing_instructions.headers() {
+            let header_name = HeaderName::try_from(name.to_string())
+                .map_err(|e| Error::Auth(format!("Invalid header name: {e}")))?;
+            let header_value = HeaderValue::try_from(value.to_string())
+                .map_err(|e| Error::Auth(format!("Invalid header value: {e}")))?;
+            signed_headers.insert(header_name, header_value);
+        }
+
+        Ok(signed_headers)
+    }
+
+    async fn xml_request(
+        &self,
+        method: Method,
+        url: reqwest::Url,
+        content_type: Option<&str>,
+        body: Option<Vec<u8>>,
+    ) -> Result<String> {
+        let body = body.unwrap_or_default();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_str(&Self::sha256_hash(&body))
+                .map_err(|e| Error::Auth(format!("Invalid content hash header: {e}")))?,
+        );
+        headers.insert(
+            "host",
+            HeaderValue::from_str(&self.request_host(&url)?)
+                .map_err(|e| Error::Auth(format!("Invalid host header: {e}")))?,
+        );
+
+        if let Some(content_type) = content_type {
+            headers.insert(
+                CONTENT_TYPE,
+                HeaderValue::from_str(content_type)
+                    .map_err(|e| Error::Auth(format!("Invalid content type header: {e}")))?,
+            );
+        }
+
+        let signed_headers = self
+            .sign_xml_request(&method, url.as_str(), &headers, &body)
+            .await?;
+
+        let mut request_builder = self.xml_http_client.request(method, url);
+        for (name, value) in &signed_headers {
+            request_builder = request_builder.header(name, value);
+        }
+        if !body.is_empty() {
+            request_builder = request_builder.body(body);
+        }
+
+        let response = request_builder
+            .send()
+            .await
+            .map_err(|e| Error::Network(format!("Request failed: {e}")))?;
+
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| Error::Network(format!("Failed to read response: {e}")))?;
+
+        if !status.is_success() {
+            return Err(Error::Network(format!(
+                "HTTP {}: {}",
+                status.as_u16(),
+                text
+            )));
+        }
+
+        Ok(text)
     }
 
     fn bucket_policy_error_kind(
@@ -905,6 +1448,8 @@ impl ObjectStore for S3Client {
             anonymous: true,
             select: false,
             notifications: true,
+            lifecycle: true,
+            replication: true,
         })
     }
 
@@ -1541,17 +2086,474 @@ impl ObjectStore for S3Client {
 
         Ok(())
     }
+
+    async fn get_bucket_lifecycle(&self, bucket: &str) -> Result<Vec<LifecycleRule>> {
+        let response = match self
+            .inner
+            .get_bucket_lifecycle_configuration()
+            .bucket(bucket)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(error) => {
+                let error_text = Self::format_sdk_error(&error);
+                if error_text.contains("NoSuchLifecycleConfiguration")
+                    || error_text.contains("lifecycle configuration is not found")
+                {
+                    return Ok(Vec::new());
+                }
+                return Err(Error::General(format!(
+                    "get_bucket_lifecycle: {error_text}"
+                )));
+            }
+        };
+
+        let mut rules = Vec::new();
+        for sdk_rule in response.rules() {
+            let id = sdk_rule.id().unwrap_or("").to_string();
+            let status = match sdk_rule.status().as_str() {
+                "Enabled" => rc_core::LifecycleRuleStatus::Enabled,
+                _ => rc_core::LifecycleRuleStatus::Disabled,
+            };
+
+            let prefix = parse_lifecycle_filter_prefix(sdk_rule.filter());
+            let tags = parse_lifecycle_filter_tags(sdk_rule.filter());
+
+            let expiration = sdk_rule
+                .expiration()
+                .map(|exp| rc_core::LifecycleExpiration {
+                    days: exp.days(),
+                    date: exp.date().map(|d| d.to_string()),
+                });
+
+            let transition = sdk_rule
+                .transitions()
+                .first()
+                .map(|t| rc_core::LifecycleTransition {
+                    days: t.days(),
+                    date: t.date().map(|d| d.to_string()),
+                    storage_class: t
+                        .storage_class()
+                        .map(|sc| sc.as_str().to_string())
+                        .unwrap_or_default(),
+                });
+
+            let noncurrent_version_expiration =
+                sdk_rule.noncurrent_version_expiration().map(|nve| {
+                    rc_core::NoncurrentVersionExpiration {
+                        noncurrent_days: nve.noncurrent_days().unwrap_or(0),
+                        newer_noncurrent_versions: nve.newer_noncurrent_versions(),
+                    }
+                });
+
+            let noncurrent_version_transition = sdk_rule
+                .noncurrent_version_transitions()
+                .first()
+                .map(|nvt| rc_core::NoncurrentVersionTransition {
+                    noncurrent_days: nvt.noncurrent_days().unwrap_or(0),
+                    storage_class: nvt
+                        .storage_class()
+                        .map(|sc| sc.as_str().to_string())
+                        .unwrap_or_default(),
+                });
+
+            let abort_incomplete_multipart_upload_days = sdk_rule
+                .abort_incomplete_multipart_upload()
+                .and_then(|a| a.days_after_initiation());
+
+            let expired_object_delete_marker = sdk_rule
+                .expiration()
+                .and_then(|e| e.expired_object_delete_marker())
+                .filter(|v| *v);
+
+            rules.push(LifecycleRule {
+                id,
+                status,
+                prefix,
+                tags,
+                expiration,
+                transition,
+                noncurrent_version_expiration,
+                noncurrent_version_transition,
+                abort_incomplete_multipart_upload_days,
+                expired_object_delete_marker,
+            });
+        }
+
+        Ok(rules)
+    }
+
+    async fn set_bucket_lifecycle(&self, bucket: &str, rules: Vec<LifecycleRule>) -> Result<()> {
+        use aws_sdk_s3::types::{
+            AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, ExpirationStatus,
+            LifecycleExpiration as SdkExpiration, LifecycleRule as SdkRule,
+            NoncurrentVersionExpiration as SdkNve, NoncurrentVersionTransition as SdkNvt,
+            Transition, TransitionStorageClass,
+        };
+
+        let mut sdk_rules = Vec::new();
+        for rule in rules {
+            let status = match rule.status {
+                rc_core::LifecycleRuleStatus::Enabled => ExpirationStatus::Enabled,
+                rc_core::LifecycleRuleStatus::Disabled => ExpirationStatus::Disabled,
+            };
+
+            let filter = build_lifecycle_rule_filter(rule.prefix.as_deref(), rule.tags.as_ref())?;
+
+            let expiration = rule.expiration.map(|exp| {
+                let mut builder = SdkExpiration::builder();
+                if let Some(days) = exp.days {
+                    builder = builder.days(days);
+                }
+                if let Some(ref date_str) = exp.date
+                    && let Ok(dt) = aws_smithy_types::DateTime::from_str(
+                        date_str,
+                        aws_smithy_types::date_time::Format::DateTime,
+                    )
+                {
+                    builder = builder.date(dt);
+                }
+                if let Some(true) = rule.expired_object_delete_marker {
+                    builder = builder.expired_object_delete_marker(true);
+                }
+                builder.build()
+            });
+
+            let transitions = rule.transition.map(|t| {
+                #[allow(deprecated)]
+                let sc = TransitionStorageClass::from(t.storage_class.as_str());
+                let mut builder = Transition::builder().storage_class(sc);
+                if let Some(days) = t.days {
+                    builder = builder.days(days);
+                }
+                if let Some(ref date_str) = t.date
+                    && let Ok(dt) = aws_smithy_types::DateTime::from_str(
+                        date_str,
+                        aws_smithy_types::date_time::Format::DateTime,
+                    )
+                {
+                    builder = builder.date(dt);
+                }
+                vec![builder.build()]
+            });
+
+            let nve = rule.noncurrent_version_expiration.map(|nve| {
+                let mut builder = SdkNve::builder().noncurrent_days(nve.noncurrent_days);
+                if let Some(newer) = nve.newer_noncurrent_versions {
+                    builder = builder.newer_noncurrent_versions(newer);
+                }
+                builder.build()
+            });
+
+            let nvt = rule.noncurrent_version_transition.map(|nvt| {
+                let sc = TransitionStorageClass::from(nvt.storage_class.as_str());
+                let builder = SdkNvt::builder()
+                    .noncurrent_days(nvt.noncurrent_days)
+                    .storage_class(sc);
+                vec![builder.build()]
+            });
+
+            let abort = rule.abort_incomplete_multipart_upload_days.map(|days| {
+                AbortIncompleteMultipartUpload::builder()
+                    .days_after_initiation(days)
+                    .build()
+            });
+
+            let mut builder = SdkRule::builder().id(&rule.id).status(status);
+            if let Some(filter) = filter {
+                builder = builder.filter(filter);
+            }
+            if let Some(expiration) = expiration {
+                builder = builder.expiration(expiration);
+            }
+            if let Some(transitions) = transitions {
+                builder = builder.set_transitions(Some(transitions));
+            }
+            if let Some(nve) = nve {
+                builder = builder.noncurrent_version_expiration(nve);
+            }
+            if let Some(nvt) = nvt {
+                builder = builder.set_noncurrent_version_transitions(Some(nvt));
+            }
+            if let Some(abort) = abort {
+                builder = builder.abort_incomplete_multipart_upload(abort);
+            }
+
+            let sdk_rule = builder
+                .build()
+                .map_err(|e| Error::General(format!("build lifecycle rule: {e}")))?;
+            sdk_rules.push(sdk_rule);
+        }
+
+        let config = BucketLifecycleConfiguration::builder()
+            .set_rules(Some(sdk_rules))
+            .build()
+            .map_err(|e| Error::General(format!("build lifecycle config: {e}")))?;
+
+        self.inner
+            .put_bucket_lifecycle_configuration()
+            .bucket(bucket)
+            .lifecycle_configuration(config)
+            .send()
+            .await
+            .map_err(|e| {
+                Error::General(format!(
+                    "set_bucket_lifecycle: {}",
+                    Self::format_sdk_error(&e)
+                ))
+            })?;
+
+        Ok(())
+    }
+
+    async fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<()> {
+        self.inner
+            .delete_bucket_lifecycle()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|e| {
+                Error::General(format!(
+                    "delete_bucket_lifecycle: {}",
+                    Self::format_sdk_error(&e)
+                ))
+            })?;
+        Ok(())
+    }
+
+    async fn restore_object(&self, path: &RemotePath, days: i32) -> Result<()> {
+        use aws_sdk_s3::types::RestoreRequest;
+
+        let request = RestoreRequest::builder().days(days).build();
+        self.inner
+            .restore_object()
+            .bucket(&path.bucket)
+            .key(&path.key)
+            .restore_request(request)
+            .send()
+            .await
+            .map_err(|e| {
+                Error::General(format!("restore_object: {}", Self::format_sdk_error(&e)))
+            })?;
+        Ok(())
+    }
+
+    async fn get_bucket_replication(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<ReplicationConfiguration>> {
+        let url = self.replication_url(bucket)?;
+        let body = match self.xml_request(Method::GET, url, None, None).await {
+            Ok(body) => body,
+            Err(Error::Network(error_text))
+                if error_text.contains("ReplicationConfigurationNotFound")
+                    || error_text.contains("replication configuration is not found")
+                    || error_text.contains("replication not found") =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(Error::General(format!("get_bucket_replication: {error}")));
+            }
+        };
+
+        parse_replication_configuration_xml(&body).map(Some)
+    }
+
+    async fn set_bucket_replication(
+        &self,
+        bucket: &str,
+        config: ReplicationConfiguration,
+    ) -> Result<()> {
+        let url = self.replication_url(bucket)?;
+        let body = build_replication_configuration_xml(&config).into_bytes();
+        self.xml_request(Method::PUT, url, Some("application/xml"), Some(body))
+            .await
+            .map_err(|e| Error::General(format!("set_bucket_replication: {e}")))?;
+
+        Ok(())
+    }
+
+    async fn delete_bucket_replication(&self, bucket: &str) -> Result<()> {
+        self.inner
+            .delete_bucket_replication()
+            .bucket(bucket)
+            .send()
+            .await
+            .map_err(|e| {
+                Error::General(format!(
+                    "delete_bucket_replication: {}",
+                    Self::format_sdk_error(&e)
+                ))
+            })?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_object_info_creation() {
         let info = ObjectInfo::file("test.txt", 1024);
         assert_eq!(info.key, "test.txt");
         assert_eq!(info.size_bytes, Some(1024));
+    }
+
+    #[test]
+    fn parse_replication_configuration_xml_reads_delete_replication() {
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Role>arn:rustfs:replication:us-east-1:123:test</Role>
+  <Rule>
+    <Status>Enabled</Status>
+    <Destination>
+      <Bucket>arn:rustfs:replication:us-east-1:123:dest</Bucket>
+      <StorageClass>STANDARD</StorageClass>
+    </Destination>
+    <ID>rule-1</ID>
+    <Priority>1</Priority>
+    <Filter>
+      <Prefix>logs/</Prefix>
+    </Filter>
+    <ExistingObjectReplication>
+      <Status>Enabled</Status>
+    </ExistingObjectReplication>
+    <DeleteMarkerReplication>
+      <Status>Disabled</Status>
+    </DeleteMarkerReplication>
+    <DeleteReplication>
+      <Status>Enabled</Status>
+    </DeleteReplication>
+  </Rule>
+</ReplicationConfiguration>"#;
+
+        let config = parse_replication_configuration_xml(body).expect("parse replication xml");
+        assert_eq!(config.role, "arn:rustfs:replication:us-east-1:123:test");
+        assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].id, "rule-1");
+        assert_eq!(config.rules[0].prefix.as_deref(), Some("logs/"));
+        assert_eq!(config.rules[0].delete_replication, Some(true));
+        assert_eq!(config.rules[0].delete_marker_replication, Some(false));
+        assert_eq!(config.rules[0].existing_object_replication, Some(true));
+    }
+
+    #[test]
+    fn parse_replication_configuration_xml_preserves_tag_filters() {
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ReplicationConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Rule>
+    <Status>Enabled</Status>
+    <Destination>
+      <Bucket>arn:rustfs:replication:us-east-1:123:dest</Bucket>
+    </Destination>
+    <ID>tagged-rule</ID>
+    <Priority>2</Priority>
+    <Filter>
+      <And>
+        <Prefix>logs/</Prefix>
+        <Tag>
+          <Key>env</Key>
+          <Value>prod</Value>
+        </Tag>
+        <Tag>
+          <Key>team</Key>
+          <Value>core</Value>
+        </Tag>
+      </And>
+    </Filter>
+  </Rule>
+</ReplicationConfiguration>"#;
+
+        let config = parse_replication_configuration_xml(body).expect("parse replication xml");
+        let rule = &config.rules[0];
+        assert_eq!(rule.prefix.as_deref(), Some("logs/"));
+        let tags = rule.tags.as_ref().expect("tag filters");
+        assert_eq!(tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(tags.get("team").map(String::as_str), Some("core"));
+    }
+
+    #[test]
+    fn build_replication_configuration_xml_writes_delete_replication() {
+        let config = ReplicationConfiguration {
+            role: "arn:rustfs:replication:us-east-1:123:test".to_string(),
+            rules: vec![rc_core::ReplicationRule {
+                id: "rule-1".to_string(),
+                priority: 1,
+                status: rc_core::ReplicationRuleStatus::Enabled,
+                prefix: Some("logs/".to_string()),
+                tags: None,
+                destination: rc_core::ReplicationDestination {
+                    bucket_arn: "arn:rustfs:replication:us-east-1:123:dest".to_string(),
+                    storage_class: Some("STANDARD".to_string()),
+                },
+                delete_marker_replication: Some(true),
+                existing_object_replication: Some(true),
+                delete_replication: Some(true),
+            }],
+        };
+
+        let xml = build_replication_configuration_xml(&config);
+        assert!(xml.contains("<DeleteReplication><Status>Enabled</Status></DeleteReplication>"));
+        assert!(xml.contains(
+            "<ExistingObjectReplication><Status>Enabled</Status></ExistingObjectReplication>"
+        ));
+        assert!(xml.contains(
+            "<DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication>"
+        ));
+        assert!(xml.contains("<Filter><Prefix>logs/</Prefix></Filter>"));
+    }
+
+    #[test]
+    fn build_replication_configuration_xml_writes_and_tag_filters() {
+        let mut tags = HashMap::new();
+        tags.insert("env".to_string(), "prod".to_string());
+        tags.insert("team".to_string(), "core".to_string());
+
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![rc_core::ReplicationRule {
+                id: "rule-1".to_string(),
+                priority: 1,
+                status: rc_core::ReplicationRuleStatus::Enabled,
+                prefix: Some("logs/".to_string()),
+                tags: Some(tags),
+                destination: rc_core::ReplicationDestination {
+                    bucket_arn: "arn:rustfs:replication:us-east-1:123:dest".to_string(),
+                    storage_class: None,
+                },
+                delete_marker_replication: None,
+                existing_object_replication: None,
+                delete_replication: None,
+            }],
+        };
+
+        let xml = build_replication_configuration_xml(&config);
+        assert!(xml.contains("<Filter><And><Prefix>logs/</Prefix>"));
+        assert!(xml.contains("<Tag><Key>env</Key><Value>prod</Value></Tag>"));
+        assert!(xml.contains("<Tag><Key>team</Key><Value>core</Value></Tag>"));
+    }
+
+    #[test]
+    fn build_lifecycle_rule_filter_preserves_prefix_and_tags() {
+        let mut tags = HashMap::new();
+        tags.insert("env".to_string(), "prod".to_string());
+        tags.insert("team".to_string(), "core".to_string());
+
+        let filter = build_lifecycle_rule_filter(Some("logs/"), Some(&tags))
+            .expect("build lifecycle filter")
+            .expect("lifecycle filter");
+
+        assert_eq!(
+            parse_lifecycle_filter_prefix(Some(&filter)).as_deref(),
+            Some("logs/")
+        );
+        let parsed_tags = parse_lifecycle_filter_tags(Some(&filter)).expect("parsed tags");
+        assert_eq!(parsed_tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(parsed_tags.get("team").map(String::as_str), Some("core"));
     }
 
     #[test]
