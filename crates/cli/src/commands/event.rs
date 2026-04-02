@@ -523,6 +523,13 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_event_list_defaults_when_inputs_are_blank() {
+        let events = parse_event_list(&[" , ,  ".to_string(), "".to_string()]);
+
+        assert_eq!(events, vec!["s3:ObjectCreated:*".to_string()]);
+    }
+
+    #[test]
     fn test_upsert_notification_replaces_existing_rule_for_same_arn() {
         let mut rules = vec![BucketNotification {
             id: None,
