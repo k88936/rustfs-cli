@@ -537,6 +537,7 @@ mod tests {
         assert!(parse_bucket_path("local//bucket").is_err());
         assert!(parse_bucket_path("local/my-bucket/nested").is_err());
         assert!(parse_bucket_path("local///").is_err());
+        assert!(parse_bucket_path("local/my-bucket/object.txt").is_err());
     }
 
     #[test]
