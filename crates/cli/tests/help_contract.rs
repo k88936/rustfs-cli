@@ -135,6 +135,7 @@ fn top_level_command_help_contract() {
                 "mirror",
                 "tree",
                 "share",
+                "sql",
                 "version",
                 "tag",
                 "cors",
@@ -322,6 +323,16 @@ fn top_level_command_help_contract() {
             args: &["share"],
             usage: "Usage: rc share [OPTIONS] <PATH>",
             expected_tokens: &["--expire", "--upload", "--content-type"],
+        },
+        HelpCase {
+            args: &["sql"],
+            usage: "Usage: rc sql [OPTIONS] --query <QUERY> <PATH>",
+            expected_tokens: &[
+                "--query",
+                "--input-format",
+                "--output-format",
+                "--compression",
+            ],
         },
         HelpCase {
             args: &["version"],
