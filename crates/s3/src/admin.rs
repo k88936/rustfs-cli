@@ -995,6 +995,8 @@ mod tests {
         assert_eq!(value["scanMode"], scan_mode);
         assert_eq!(value["updateParity"], false);
         assert_eq!(value["nolock"], false);
+        assert!(value.get("bucket").is_none());
+        assert!(value.get("prefix").is_none());
     }
 
     #[test]
@@ -1155,8 +1157,8 @@ mod tests {
         let (endpoint, receiver, handle) = start_admin_test_server("200 OK", "");
         let client = admin_client_for_endpoint(&endpoint);
         let request = HealStartRequest {
-            bucket: Some("photos".to_string()),
-            prefix: Some("2026/raw".to_string()),
+            bucket: Some("raw photos".to_string()),
+            prefix: Some("2026/april".to_string()),
             scan_mode: HealScanMode::Deep,
             remove: true,
             recreate: true,
@@ -1174,7 +1176,10 @@ mod tests {
 
         let request = receiver.recv().expect("captured request");
         assert_eq!(request.method, "POST");
-        assert_eq!(request.target, "/rustfs/admin/v3/heal/photos/2026%2Fraw");
+        assert_eq!(
+            request.target,
+            "/rustfs/admin/v3/heal/raw%20photos/2026%2Fapril"
+        );
         assert_heal_options_body(&request.body, 2, true, true, true);
         handle.join().expect("server thread should finish");
     }
