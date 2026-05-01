@@ -1,7 +1,9 @@
 # rc - Rust S3 CLI Client
 
 [![CI](https://github.com/rustfs/cli/actions/workflows/ci.yml/badge.svg)](https://github.com/rustfs/cli/actions/workflows/ci.yml)
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-APACHE)
+[![Crates.io](https://img.shields.io/crates/v/rustfs-cli.svg)](https://crates.io/crates/rustfs-cli)
+[![Docs.rs](https://docs.rs/rustfs-cli/badge.svg)](https://docs.rs/rustfs-cli)
 
 A S3-compatible command-line client written in Rust.
 
@@ -249,73 +251,73 @@ rc admin heal status local --json
 
 ## Command Overview
 
-| Command | Description |
-|---------|-------------|
-| `alias` | Manage storage service aliases |
-| `admin` | Manage IAM users, policies, groups, service accounts, and cluster operations |
-| `ls` | List buckets or objects |
-| `mb` | Make bucket |
-| `rb` | Remove bucket |
-| `cp` | Copy objects |
-| `mv` | Move objects |
-| `rm` | Remove objects |
-| `cat` | Display object contents |
-| `head` | Display first N lines of object |
-| `stat` | Display object metadata |
-| `find` | Find objects |
-| `anonymous` | Manage anonymous access to buckets and objects |
-| `diff` | Compare two locations |
-| `mirror` | Mirror sync between S3 locations |
-| `tree` | Tree view display |
-| `share` | Generate presigned URLs |
-| `event` | Manage bucket event notifications |
-| `cors` | Manage bucket CORS configuration |
-| `pipe` | Upload from stdin |
-| `version` | Manage bucket versioning |
-| `tag` | Manage bucket and object tags |
-| `quota` | Manage bucket quota |
-| `ilm` | Manage lifecycle rules, storage tiers, and object restore |
-| `replicate` | Manage bucket replication |
-| `completions` | Generate shell completion scripts |
+| Command       | Description                                                                  |
+|---------------|------------------------------------------------------------------------------|
+| `alias`       | Manage storage service aliases                                               |
+| `admin`       | Manage IAM users, policies, groups, service accounts, and cluster operations |
+| `ls`          | List buckets or objects                                                      |
+| `mb`          | Make bucket                                                                  |
+| `rb`          | Remove bucket                                                                |
+| `cp`          | Copy objects                                                                 |
+| `mv`          | Move objects                                                                 |
+| `rm`          | Remove objects                                                               |
+| `cat`         | Display object contents                                                      |
+| `head`        | Display first N lines of object                                              |
+| `stat`        | Display object metadata                                                      |
+| `find`        | Find objects                                                                 |
+| `anonymous`   | Manage anonymous access to buckets and objects                               |
+| `diff`        | Compare two locations                                                        |
+| `mirror`      | Mirror sync between S3 locations                                             |
+| `tree`        | Tree view display                                                            |
+| `share`       | Generate presigned URLs                                                      |
+| `event`       | Manage bucket event notifications                                            |
+| `cors`        | Manage bucket CORS configuration                                             |
+| `pipe`        | Upload from stdin                                                            |
+| `version`     | Manage bucket versioning                                                     |
+| `tag`         | Manage bucket and object tags                                                |
+| `quota`       | Manage bucket quota                                                          |
+| `ilm`         | Manage lifecycle rules, storage tiers, and object restore                    |
+| `replicate`   | Manage bucket replication                                                    |
+| `completions` | Generate shell completion scripts                                            |
 
 ### Admin Subcommands
 
-| Command | Description |
-|---------|-------------|
-| `admin user` | Manage IAM users (add, remove, list, info, enable, disable) |
-| `admin policy` | Manage IAM policies (create, remove, list, info, attach) |
-| `admin group` | Manage IAM groups (add, remove, list, info, enable, disable, add-members, rm-members) |
-| `admin service-account` | Manage service accounts (create, remove, list, info) |
-| `admin info` | Display cluster information (cluster, server, disk) |
-| `admin heal` | Manage cluster healing operations (status, start, stop) |
+| Command                 | Description                                                                           |
+|-------------------------|---------------------------------------------------------------------------------------|
+| `admin user`            | Manage IAM users (add, remove, list, info, enable, disable)                           |
+| `admin policy`          | Manage IAM policies (create, remove, list, info, attach)                              |
+| `admin group`           | Manage IAM groups (add, remove, list, info, enable, disable, add-members, rm-members) |
+| `admin service-account` | Manage service accounts (create, remove, list, info)                                  |
+| `admin info`            | Display cluster information (cluster, server, disk)                                   |
+| `admin heal`            | Manage cluster healing operations (status, start, stop)                               |
 
 ### ILM Subcommands
 
-| Command | Description |
-|---------|-------------|
-| `ilm rule add` | Add a lifecycle rule to a bucket |
-| `ilm rule edit` | Edit an existing lifecycle rule |
-| `ilm rule list` | List lifecycle rules on a bucket |
-| `ilm rule remove` | Remove lifecycle rules from a bucket |
-| `ilm rule export` | Export lifecycle configuration as JSON |
+| Command           | Description                              |
+|-------------------|------------------------------------------|
+| `ilm rule add`    | Add a lifecycle rule to a bucket         |
+| `ilm rule edit`   | Edit an existing lifecycle rule          |
+| `ilm rule list`   | List lifecycle rules on a bucket         |
+| `ilm rule remove` | Remove lifecycle rules from a bucket     |
+| `ilm rule export` | Export lifecycle configuration as JSON   |
 | `ilm rule import` | Import lifecycle configuration from JSON |
-| `ilm tier add` | Add a remote storage tier |
-| `ilm tier edit` | Edit tier credentials |
-| `ilm tier list` | List all configured storage tiers |
-| `ilm tier info` | Show details for a specific tier |
-| `ilm tier remove` | Remove a storage tier |
-| `ilm restore` | Restore a transitioned (archived) object |
+| `ilm tier add`    | Add a remote storage tier                |
+| `ilm tier edit`   | Edit tier credentials                    |
+| `ilm tier list`   | List all configured storage tiers        |
+| `ilm tier info`   | Show details for a specific tier         |
+| `ilm tier remove` | Remove a storage tier                    |
+| `ilm restore`     | Restore a transitioned (archived) object |
 
 ### Replicate Subcommands
 
-| Command | Description |
-|---------|-------------|
-| `replicate add` | Add a new replication rule |
-| `replicate update` | Update an existing replication rule |
-| `replicate list` | List replication rules for a bucket |
-| `replicate status` | Show replication status and metrics |
-| `replicate remove` | Remove replication rules |
-| `replicate export` | Export replication configuration as JSON |
+| Command            | Description                                |
+|--------------------|--------------------------------------------|
+| `replicate add`    | Add a new replication rule                 |
+| `replicate update` | Update an existing replication rule        |
+| `replicate list`   | List replication rules for a bucket        |
+| `replicate status` | Show replication status and metrics        |
+| `replicate remove` | Remove replication rules                   |
+| `replicate export` | Export replication configuration as JSON   |
 | `replicate import` | Import replication configuration from JSON |
 
 ## Output Format
@@ -337,8 +339,16 @@ rc ls local/bucket --json
 ```json
 {
   "items": [
-    {"key": "dir/", "is_dir": true},
-    {"key": "file.txt", "size_bytes": 1258291, "size_human": "1.2 MiB", "is_dir": false}
+    {
+      "key": "dir/",
+      "is_dir": true
+    },
+    {
+      "key": "file.txt",
+      "size_bytes": 1258291,
+      "size_human": "1.2 MiB",
+      "is_dir": false
+    }
   ],
   "truncated": false
 }
@@ -399,28 +409,28 @@ region = "us-east-1"
 
 ## Exit Codes
 
-| Code | Description |
-|------|-------------|
-| 0 | Success |
-| 1 | General error |
-| 2 | Usage/path error |
-| 3 | Network error (retryable) |
-| 4 | Authentication/permission error |
-| 5 | Resource not found |
-| 6 | Conflict/precondition failed |
-| 7 | Feature not supported |
-| 130 | Interrupted (Ctrl+C) |
+| Code | Description                     |
+|------|---------------------------------|
+| 0    | Success                         |
+| 1    | General error                   |
+| 2    | Usage/path error                |
+| 3    | Network error (retryable)       |
+| 4    | Authentication/permission error |
+| 5    | Resource not found              |
+| 6    | Conflict/precondition failed    |
+| 7    | Feature not supported           |
+| 130  | Interrupted (Ctrl+C)            |
 
 ## Compatibility
 
 ### Supported Backends
 
-| Backend | Tier | Description |
-|---------|------|-------------|
-| RustFS | Tier 1 | Fully supported |
-| MinIO | Tier 2 | Fully supported |
-| AWS S3 | Tier 3 | Best effort support |
-| Other S3-compatible | Best Effort | No guarantee |
+| Backend             | Tier        | Description         |
+|---------------------|-------------|---------------------|
+| RustFS              | Tier 1      | Fully supported     |
+| MinIO               | Tier 2      | Fully supported     |
+| AWS S3              | Tier 3      | Best effort support |
+| Other S3-compatible | Best Effort | No guarantee        |
 
 ### Minimum Rust Version
 
@@ -459,7 +469,8 @@ Contributions are welcome! Please read [AGENTS.md](AGENTS.md) for development gu
 
 ## License
 
-This project is dual-licensed under MIT or Apache-2.0. See [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+This project is dual-licensed under MIT or Apache-2.0. See [LICENSE-MIT](LICENSE-MIT)
+and [LICENSE-APACHE](LICENSE-APACHE).
 
 ## Acknowledgments
 
