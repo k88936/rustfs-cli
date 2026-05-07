@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use crate::exit_code::ExitCode;
 use crate::output::{Formatter, OutputConfig};
-use rc_core::{Alias, AliasManager};
+use rc_core::{Alias, AliasManager, validate_alias_endpoint};
 
 /// Alias subcommands for managing storage service connections
 #[derive(Subcommand, Debug)]
@@ -134,6 +134,11 @@ async fn execute_set(args: SetArgs, manager: &AliasManager, formatter: &Formatte
         return ExitCode::UsageError;
     }
 
+    if let Err(e) = validate_alias_endpoint(&args.endpoint) {
+        formatter.error(&alias_endpoint_error_message(e));
+        return ExitCode::UsageError;
+    }
+
     // Validate signature version
     if args.signature != "v4" && args.signature != "v2" {
         formatter.error("Signature must be 'v4' or 'v2'");
@@ -250,6 +255,13 @@ async fn execute_remove(
     }
 }
 
+fn alias_endpoint_error_message(error: rc_core::Error) -> String {
+    match error {
+        rc_core::Error::Config(message) => message,
+        other => format!("Invalid endpoint: {other}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +294,38 @@ mod tests {
         assert_eq!(info.name, "test");
         assert_eq!(info.endpoint, "http://localhost:9000");
         assert_eq!(info.region, "us-east-1");
+    }
+
+    #[tokio::test]
+    async fn test_execute_set_rejects_invalid_endpoint_url() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let manager = AliasManager::with_config_manager(rc_core::ConfigManager::with_path(
+            temp_dir.path().join("config.toml"),
+        ));
+        let formatter = Formatter::new(OutputConfig::default());
+        let args = SetArgs {
+            name: "rustfs".to_string(),
+            endpoint: "http://rustfs-node{1...32}:9000".to_string(),
+            access_key: "accesskey".to_string(),
+            secret_key: "secretkey".to_string(),
+            region: "us-east-1".to_string(),
+            signature: "v4".to_string(),
+            bucket_lookup: "auto".to_string(),
+            insecure: false,
+        };
+
+        let exit_code = execute_set(args, &manager, &formatter).await;
+
+        assert_eq!(exit_code, ExitCode::UsageError);
+        assert!(manager.get("rustfs").is_err());
+    }
+
+    #[test]
+    fn test_alias_endpoint_error_message_omits_config_prefix() {
+        let message = alias_endpoint_error_message(rc_core::Error::Config(
+            "Endpoint must include a host".to_string(),
+        ));
+
+        assert_eq!(message, "Endpoint must include a host");
     }
 }
