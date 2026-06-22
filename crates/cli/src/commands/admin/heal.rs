@@ -10,6 +10,10 @@ use crate::exit_code::ExitCode;
 use crate::output::Formatter;
 use rc_core::admin::{AdminApi, HealScanMode, HealStartRequest, HealStatus};
 
+const HEAL_STOP_SUCCESS_MESSAGE: &str = "Heal operation stopped successfully";
+const HEAL_STOP_STILL_RUNNING_MESSAGE: &str =
+    "Heal stop request was accepted, but heal status is still in progress";
+
 /// Heal subcommands
 #[derive(Subcommand, Debug)]
 pub enum HealCommands {
@@ -136,6 +140,28 @@ struct HealOperationOutput {
     message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<HealStatusOutput>,
+}
+
+fn heal_stop_output(status: &HealStatus) -> (ExitCode, HealOperationOutput) {
+    let success = !status.healing;
+    let message = if success {
+        HEAL_STOP_SUCCESS_MESSAGE
+    } else {
+        HEAL_STOP_STILL_RUNNING_MESSAGE
+    };
+
+    (
+        if success {
+            ExitCode::Success
+        } else {
+            ExitCode::GeneralError
+        },
+        HealOperationOutput {
+            success,
+            message: message.to_string(),
+            status: has_heal_status_details(status).then(|| HealStatusOutput::from(status)),
+        },
+    )
 }
 
 /// Execute a heal subcommand
@@ -294,17 +320,27 @@ async fn execute_stop(args: StopArgs, formatter: &Formatter) -> ExitCode {
 
     match client.heal_stop().await {
         Ok(()) => {
+            let status = match client.heal_status().await {
+                Ok(status) => status,
+                Err(e) => {
+                    formatter.error(&format!(
+                        "Heal stop request was accepted, but failed to verify heal status: {e}"
+                    ));
+                    return ExitCode::GeneralError;
+                }
+            };
+            let (exit_code, output) = heal_stop_output(&status);
+
             if formatter.is_json() {
-                let output = HealOperationOutput {
-                    success: true,
-                    message: "Heal operation stopped successfully".to_string(),
-                    status: None,
-                };
                 formatter.json(&output);
+            } else if output.success {
+                formatter.success(&format!("{}.", output.message));
             } else {
-                formatter.success("Heal operation stopped successfully.");
+                formatter.error(&format!("{}.", output.message));
+                formatter.println("");
+                print_heal_status(&status, formatter);
             }
-            ExitCode::Success
+            exit_code
         }
         Err(e) => {
             formatter.error(&format!("Failed to stop heal operation: {e}"));
@@ -382,6 +418,35 @@ mod tests {
         assert!(status_value.get("healQueueLength").is_some());
         assert!(status_value.get("healActiveTasks").is_some());
         assert!(status_value.get("itemsScanned").is_some());
+    }
+
+    #[test]
+    fn test_heal_stop_output_reports_still_running_status() {
+        let status = HealStatus {
+            healing: true,
+            heal_active_tasks: 1,
+            started: Some("2026-06-15T10:11:18Z".to_string()),
+            ..Default::default()
+        };
+
+        let (exit_code, output) = heal_stop_output(&status);
+
+        assert_eq!(exit_code, ExitCode::GeneralError);
+        assert!(!output.success);
+        assert_eq!(output.message, HEAL_STOP_STILL_RUNNING_MESSAGE);
+        assert!(output.status.is_some());
+    }
+
+    #[test]
+    fn test_heal_stop_output_reports_success_for_idle_status() {
+        let status = HealStatus::default();
+
+        let (exit_code, output) = heal_stop_output(&status);
+
+        assert_eq!(exit_code, ExitCode::Success);
+        assert!(output.success);
+        assert_eq!(output.message, HEAL_STOP_SUCCESS_MESSAGE);
+        assert!(output.status.is_none());
     }
 
     #[test]
