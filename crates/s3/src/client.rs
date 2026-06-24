@@ -2515,20 +2515,6 @@ impl ObjectStore for S3Client {
             Ok(response) => response,
             Err(error) => {
                 let error_text = error.to_string();
-                if error_text.contains("service error")
-                    && let Ok(url) = self.cors_url(bucket)
-                {
-                    match self.xml_request(Method::GET, url, None, None).await {
-                        Ok(body) => return parse_cors_configuration_xml(&body),
-                        Err(Error::Network(raw_error))
-                            if is_missing_cors_configuration_error(&raw_error) =>
-                        {
-                            return Ok(Vec::new());
-                        }
-                        Err(_) => {}
-                    }
-                }
-
                 let missing_config =
                     if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &error {
                         is_missing_cors_configuration_response(
@@ -2543,6 +2529,21 @@ impl ObjectStore for S3Client {
                 if missing_config {
                     return Ok(Vec::new());
                 }
+
+                if error_text.contains("service error")
+                    && let Ok(url) = self.cors_url(bucket)
+                {
+                    match self.xml_request(Method::GET, url, None, None).await {
+                        Ok(body) => return parse_cors_configuration_xml(&body),
+                        Err(Error::Network(raw_error))
+                            if is_missing_cors_configuration_error(&raw_error) =>
+                        {
+                            return Ok(Vec::new());
+                        }
+                        Err(_) => {}
+                    }
+                }
+
                 return Err(Error::General(format!("get_bucket_cors: {error_text}")));
             }
         };
@@ -2580,6 +2581,21 @@ impl ObjectStore for S3Client {
             Ok(_) => Ok(()),
             Err(error) => {
                 let error_text = error.to_string();
+                let missing_config =
+                    if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &error {
+                        is_missing_cors_configuration_response(
+                            service_err.err().code(),
+                            Some(service_err.raw().status().as_u16()),
+                            &error_text,
+                        )
+                    } else {
+                        is_missing_cors_configuration_response(None, None, &error_text)
+                    };
+
+                if missing_config {
+                    return Ok(());
+                }
+
                 if error_text.contains("service error")
                     && let Ok(url) = self.cors_url(bucket)
                 {
@@ -2594,22 +2610,7 @@ impl ObjectStore for S3Client {
                     }
                 }
 
-                let missing_config =
-                    if let aws_sdk_s3::error::SdkError::ServiceError(service_err) = &error {
-                        is_missing_cors_configuration_response(
-                            service_err.err().code(),
-                            Some(service_err.raw().status().as_u16()),
-                            &error_text,
-                        )
-                    } else {
-                        is_missing_cors_configuration_response(None, None, &error_text)
-                    };
-
-                if missing_config {
-                    Ok(())
-                } else {
-                    Err(Error::General(format!("delete_bucket_cors: {error_text}")))
-                }
+                Err(Error::General(format!("delete_bucket_cors: {error_text}")))
             }
         }
     }
