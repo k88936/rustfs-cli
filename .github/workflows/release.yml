@@ -240,76 +240,38 @@ jobs:
           path: artifacts/*
           if-no-files-found: error
 
-      # Upload to Aliyun OSS
-      - name: Upload to Aliyun OSS
+      # Upload to Cloudflare R2
+      - name: Upload to Cloudflare R2
         if: needs.build-check.outputs.is_release == 'true'
         env:
-          OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
-          OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
-          OSS_REGION: cn-beijing
-          OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
         shell: bash
         run: |
-          if [[ -z "$OSS_ACCESS_KEY_ID" ]]; then
-            echo "⚠️ OSS credentials not available, skipping OSS upload"
+          if [[ -z "$R2_ACCESS_KEY_ID" || -z "$R2_SECRET_ACCESS_KEY" || -z "$R2_ENDPOINT" || -z "$R2_BUCKET" ]]; then
+            echo "⚠️ R2 credentials or endpoint missing, skipping artifact upload"
             exit 0
           fi
 
-          # Install ossutil
-          OSSUTIL_VERSION="2.1.1"
-          case "${{ matrix.os_name }}" in
-            macos)
-              if [[ "$(uname -m)" == "arm64" ]]; then
-                ARCH="arm64"
-              else
-                ARCH="amd64"
-              fi
-              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-mac-${ARCH}.zip"
-              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-mac-${ARCH}"
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          export AWS_DEFAULT_REGION="auto"
 
-              curl -sL -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
-              unzip -q "$OSSUTIL_ZIP"
-              mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
-              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
-              chmod +x /usr/local/bin/ossutil
-              OSSUTIL_BIN=ossutil
-              ;;
-            linux)
-              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-linux-amd64.zip"
-              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-linux-amd64"
+          R2_PATH="s3://${R2_BUCKET}/artifacts/rustfs-cli/release/"
 
-              curl -sL -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
-              unzip -q "$OSSUTIL_ZIP"
-              mv "${OSSUTIL_DIR}/ossutil" ./ossutil
-              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
-              chmod +x ./ossutil
-              OSSUTIL_BIN=./ossutil
-              ;;
-            windows)
-              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-windows-amd64.zip"
-              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-windows-amd64"
-
-              curl -sL -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
-              unzip -q "$OSSUTIL_ZIP"
-              mv "${OSSUTIL_DIR}/ossutil.exe" ./ossutil.exe
-              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
-              OSSUTIL_BIN=./ossutil.exe
-              ;;
-          esac
-
-          OSS_PATH="oss://rustfs-artifacts/artifacts/rustfs-cli/release/"
-
-          # Upload all artifacts to OSS
-          echo "📤 Uploading artifacts to $OSS_PATH..."
+          # Upload all artifacts to R2
+          echo "📤 Uploading artifacts to $R2_PATH..."
           for file in artifacts/*; do
             if [[ -f "$file" ]]; then
               echo "Uploading: $file"
-              $OSSUTIL_BIN cp "$file" "$OSS_PATH" --force
+              aws s3 cp "$file" "$R2_PATH" --endpoint-url "$R2_ENDPOINT" --only-show-errors
               echo "✅ Uploaded: $(basename "$file")"
             fi
           done
 
-          echo "✅ OSS upload completed successfully"
+          echo "✅ R2 upload completed successfully"
 
   # Generate shell completions
   completions:
@@ -404,42 +366,36 @@ jobs:
           echo "📦 Release assets:"
           ls -la
 
-      - name: Upload release assets to Aliyun OSS
+      - name: Upload release assets to Cloudflare R2
         env:
-          OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
-          OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
-          OSS_REGION: cn-beijing
-          OSS_ENDPOINT: https://oss-cn-beijing.aliyuncs.com
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
           RELEASE_VERSION: ${{ needs.build-check.outputs.version }}
         shell: bash
         run: |
-          if [[ -z "$OSS_ACCESS_KEY_ID" ]]; then
-            echo "⚠️ OSS credentials not available, skipping release asset OSS upload"
+          if [[ -z "$R2_ACCESS_KEY_ID" || -z "$R2_SECRET_ACCESS_KEY" || -z "$R2_ENDPOINT" || -z "$R2_BUCKET" ]]; then
+            echo "⚠️ R2 credentials or endpoint missing, skipping release asset upload"
             exit 0
           fi
 
-          OSSUTIL_VERSION="2.1.1"
-          OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-linux-amd64.zip"
-          OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-linux-amd64"
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          export AWS_DEFAULT_REGION="auto"
 
-          curl -sL -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
-          unzip -q "$OSSUTIL_ZIP"
-          mv "${OSSUTIL_DIR}/ossutil" ./ossutil
-          rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
-          chmod +x ./ossutil
+          R2_PATH="s3://${R2_BUCKET}/artifacts/rustfs-cli/release/${RELEASE_VERSION}/"
 
-          OSS_PATH="oss://rustfs-artifacts/artifacts/rustfs-cli/release/${RELEASE_VERSION}/"
-
-          echo "📤 Uploading release assets to $OSS_PATH..."
+          echo "📤 Uploading release assets to $R2_PATH..."
           for file in release-assets/*; do
             if [[ -f "$file" ]]; then
               echo "Uploading: $file"
-              ./ossutil cp "$file" "$OSS_PATH" --force
+              aws s3 cp "$file" "$R2_PATH" --endpoint-url "$R2_ENDPOINT" --only-show-errors
               echo "✅ Uploaded: $(basename "$file")"
             fi
           done
 
-          echo "✅ Release asset OSS upload completed successfully"
+          echo "✅ Release asset R2 upload completed successfully"
 
       - name: Upload to GitHub Release (release event)
         if: github.event_name == 'release'
