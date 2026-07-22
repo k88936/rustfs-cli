@@ -22,6 +22,7 @@ pub mod replication;
 pub mod retry;
 pub mod select;
 pub mod traits;
+pub mod transfer;
 pub mod watch;
 
 pub use alias::{
@@ -56,5 +57,9 @@ pub use select::{
 pub use traits::{
     BucketNotification, Capabilities, ListOptions, ListResult, NotificationTarget, ObjectInfo,
     ObjectStore, ObjectVersion, ObjectVersionListResult,
+};
+pub use transfer::{
+    TransferCandidate, TransferControls, TransferExecutor, TransferOutcome, TransferOutcomeState,
+    TransferPlan, TransferReport, TransferSelection, TransferSummary,
 };
 pub use watch::{WatchApi, WatchEvent, WatchFrame, WatchRequest, WatchSource, WatchStream};
