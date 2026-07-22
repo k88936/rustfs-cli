@@ -16,6 +16,7 @@ pub mod cors;
 pub mod encryption;
 pub mod error;
 pub mod lifecycle;
+pub mod object_lock;
 pub mod ops;
 pub mod path;
 pub mod replication;
@@ -36,6 +37,10 @@ pub use error::{Error, Result};
 pub use lifecycle::{
     LifecycleConfiguration, LifecycleExpiration, LifecycleRule, LifecycleRuleStatus,
     LifecycleTransition, NoncurrentVersionExpiration, NoncurrentVersionTransition,
+};
+pub use object_lock::{
+    BucketObjectLockConfiguration, DefaultRetention, LegalHoldStatus, ObjectLockOptions,
+    ObjectRetention, RetentionDuration, RetentionDurationUnit, RetentionMode,
 };
 pub use ops::{
     HealthApi, HealthProbe, HealthReport, UsageBucket, UsageFailure, UsageReport, UsageScanApi,
