@@ -101,14 +101,15 @@ pub async fn execute(args: RbArgs, output_config: OutputConfig) -> ExitCode {
             dry_run: false,
             incomplete: false,
             versions: true,
+            version_id: None,
             bypass: false,
             purge: true,
         };
 
-        if let Err((code, _)) =
+        if let Err(error) =
             rm::delete_recursive(&client, &alias_name, &bucket, "", &rm_args, &formatter).await
         {
-            return code;
+            return error.code;
         }
     }
 

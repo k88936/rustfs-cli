@@ -507,7 +507,7 @@ impl Formatter {
         }
     }
 
-    /// Output a pre-built JSON error to stderr.
+    /// Output a pre-built JSON error record on stderr.
     pub fn json_error<T: Serialize>(&self, value: &T) {
         match serde_json::to_string_pretty(value) {
             Ok(json) => eprintln!("{json}"),
