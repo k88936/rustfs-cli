@@ -22,6 +22,7 @@ pub mod replication;
 pub mod retry;
 pub mod select;
 pub mod traits;
+pub mod watch;
 
 pub use alias::{
     Alias, AliasManager, RequestHeader, global_request_headers, set_global_request_headers,
@@ -56,3 +57,4 @@ pub use traits::{
     BucketNotification, Capabilities, ListOptions, ListResult, NotificationTarget, ObjectInfo,
     ObjectStore, ObjectVersion, ObjectVersionListResult,
 };
+pub use watch::{WatchApi, WatchEvent, WatchFrame, WatchRequest, WatchSource, WatchStream};

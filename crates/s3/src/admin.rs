@@ -1555,6 +1555,11 @@ fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<C
         availability: CapabilityAvailability::Available,
         reason: None,
     });
+    capabilities.push(CapabilityEntry {
+        name: "listen_notification".to_string(),
+        availability: CapabilityAvailability::Available,
+        reason: None,
+    });
 
     for (name, reason) in [
         (
@@ -2609,6 +2614,11 @@ mod tests {
         assert!(report.capabilities.iter().any(|capability| {
             capability.name == "admin.data-usage"
                 && capability.availability == CapabilityAvailability::Available
+        }));
+        assert!(report.capabilities.iter().any(|capability| {
+            capability.name == "listen_notification"
+                && capability.availability == CapabilityAvailability::Available
+                && capability.reason.is_none()
         }));
         for name in [
             "admin.batch",
