@@ -187,6 +187,14 @@ impl AdminClient {
         format!("{}/rustfs/admin/v4{}", self.endpoint, path)
     }
 
+    pub(crate) const fn http_client(&self) -> &Client {
+        &self.http_client
+    }
+
+    pub(crate) fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
     /// Calculate SHA256 hash of the body
     fn sha256_hash(body: &[u8]) -> String {
         let mut hasher = Sha256::new();
@@ -280,7 +288,7 @@ impl AdminClient {
     }
 
     /// Make a signed request to the admin API
-    async fn request<T: for<'de> Deserialize<'de>>(
+    pub(crate) async fn request<T: for<'de> Deserialize<'de>>(
         &self,
         method: Method,
         path: &str,
@@ -590,7 +598,7 @@ impl AdminClient {
     }
 
     /// Map HTTP status codes to appropriate errors
-    fn map_error(&self, status: StatusCode, body: &str) -> Error {
+    pub(crate) fn map_error(&self, status: StatusCode, body: &str) -> Error {
         if matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED) {
             return Error::Auth(body.to_string());
         }
@@ -1538,9 +1546,15 @@ fn stubbed_report(server_version: Option<String>, reason: String) -> CapabilityR
 }
 
 fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<CapabilityEntry>) {
-    if !version.is_some_and(|version| version.contains("1.0.0-beta.10")) {
+    if !version.is_some_and(is_rustfs_beta_10) {
         return;
     }
+
+    capabilities.push(CapabilityEntry {
+        name: "admin.data-usage".to_string(),
+        availability: CapabilityAvailability::Available,
+        reason: None,
+    });
 
     for (name, reason) in [
         (
@@ -1570,6 +1584,13 @@ fn add_known_server_capabilities(version: Option<&str>, capabilities: &mut Vec<C
             reason: Some(reason.to_string()),
         });
     }
+}
+
+fn is_rustfs_beta_10(version: &str) -> bool {
+    version
+        .split(|character: char| character.is_ascii_whitespace() || character == '/')
+        .map(|component| component.trim_start_matches('v'))
+        .any(|component| component.split('+').next() == Some("1.0.0-beta.10"))
 }
 
 #[async_trait]
@@ -2585,6 +2606,10 @@ mod tests {
                 && capability.availability == CapabilityAvailability::Unsupported
                 && capability.reason.as_deref() == Some("not available on this platform")
         }));
+        assert!(report.capabilities.iter().any(|capability| {
+            capability.name == "admin.data-usage"
+                && capability.availability == CapabilityAvailability::Available
+        }));
         for name in [
             "admin.batch",
             "admin.ldap-mutation",
@@ -2611,6 +2636,14 @@ mod tests {
             ]
         );
         handle.join().expect("server thread should finish");
+    }
+
+    #[test]
+    fn beta_10_capability_gate_does_not_match_beta_100() {
+        assert!(is_rustfs_beta_10("1.0.0-beta.10"));
+        assert!(is_rustfs_beta_10("rustfs/v1.0.0-beta.10+build.7"));
+        assert!(!is_rustfs_beta_10("1.0.0-beta.100"));
+        assert!(!is_rustfs_beta_10("1.0.0-beta.9"));
     }
 
     #[tokio::test]
