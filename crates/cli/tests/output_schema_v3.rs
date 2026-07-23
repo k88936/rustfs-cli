@@ -17,6 +17,7 @@ const V3_FAMILIES: &[&str] = &[
     "metrics",
     "scanner_status",
     "storage_info",
+    "kms",
     "admin_operations",
     "replication",
     "replication_operations",
