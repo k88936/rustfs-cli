@@ -11,6 +11,7 @@ pub struct CapturedAdminRequest {
     #[allow(dead_code)]
     pub method: String,
     pub target: String,
+    #[allow(dead_code)]
     pub body: Vec<u8>,
 }
 
