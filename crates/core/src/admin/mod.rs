@@ -5,6 +5,7 @@
 
 mod capabilities;
 mod cluster;
+mod observability;
 mod replication;
 mod site;
 pub mod tier;
@@ -22,6 +23,13 @@ pub use cluster::{
     PoolDecommissionInfo, PoolErasureSetInfo, PoolStatus, PoolTarget, RebalanceCleanupWarnings,
     RebalancePoolProgress, RebalancePoolStatus, RebalanceStartResult, RebalanceStatus, ServerInfo,
     UsageInfo,
+};
+pub use observability::{
+    MAX_METRICS_LINE_BYTES, MAX_METRICS_RESPONSE_BYTES, MAX_METRICS_SAMPLES, MetricGroup,
+    MetricGroups, MetricsBatch, MetricsQuery, MetricsScope, ObservabilityApi, RealtimeMetrics,
+    ScannerCycleSchedule, ScannerFreshness, ScannerHealth, ScannerMetrics, ScannerRuntimeConfig,
+    ScannerRuntimeConfigValue, ScannerStatus, StorageBackend, StorageBackendKind, StorageDisk,
+    StorageDiskMetrics, StorageInfo,
 };
 pub use replication::{
     MAX_REPLICATION_DIFF_RESPONSE_BYTES, ReplicationDiff, ReplicationDiffApi, ReplicationDiffEntry,

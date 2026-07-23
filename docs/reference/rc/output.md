@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | [`output_v1.json`](../../../schemas/output_v1.json) | Original S3 and alias command output | Preserved unchanged |
 | [`output_v2.json`](../../../schemas/output_v2.json) | Existing cluster and administrative output | Preserved unchanged |
-| [`output_v3.json`](../../../schemas/output_v3.json) | New capability, version, lock, multipart, watch, health, usage, metrics, admin-operation, replication, and bucket-operation families | Contract for new implementations |
+| [`output_v3.json`](../../../schemas/output_v3.json) | New capability, version, lock, multipart, watch, health, usage, metrics, scanner-status, storage-info, admin-operation, replication, and bucket-operation families | Contract for new implementations |
 
 Adding v3 does not silently change the JSON emitted by existing commands. Each command implementation must document when it adopts v3. Consumers should choose a parser from the command's documented output version instead of inferring a version from the installed `rc` release.
 
@@ -28,7 +28,7 @@ Objects allow additional properties so a newer RustFS server can expose extra di
 
 Paginated records use a `pagination` object with `truncated` and `continuation_token`. The token is `null` when there is no next page.
 
-Streaming commands emit JSON Lines. Each non-empty line is one complete v3 record and validates independently against `output_v3.json`. The schema can represent a watch keepalive with `data.event` set to `null` and `data.keepalive` set to `true`, but `rc watch` consumes RustFS transport keepalives without emitting a line. Event records set `data.keepalive` to `false`. Consumers must not parse an entire JSON Lines stream as one JSON document.
+Streaming commands emit JSON Lines. Each non-empty line is one complete v3 record and validates independently against `output_v3.json`. The schema can represent a watch keepalive with `data.event` set to `null` and `data.keepalive` set to `true`, but `rc watch` consumes RustFS transport keepalives without emitting a line. Event records set `data.keepalive` to `false`. Normalized `admin metrics` output uses the same JSON Lines rule; `--metrics-format raw` is explicitly outside the v3 envelope and emits bounded RustFS records unchanged. Consumers must not parse an entire JSON Lines stream as one JSON document.
 
 ## Version operation records
 
@@ -73,7 +73,8 @@ When migrating:
 3. Read failures under `error` and handle `unsupported_feature` separately.
 4. Treat nullable server fields as unavailable data, not as zero values.
 5. For watch output, validate and process each JSON Lines record independently.
-6. Ignore unknown object properties while continuing to require documented fields and types.
+6. For normalized metrics, retain labels and per-sample `collected_at` timestamps; do not infer one timestamp for the entire stream.
+7. Ignore unknown object properties while continuing to require documented fields and types.
 
 Commands adopting version-operation records migrate only their version-aware JSON paths. Legacy JSON remains unchanged for unversioned `stat`, `rm`, and `cp` results where the server reports no version identifiers. Scripts selecting versions must dispatch on `schema_version: 3` and read operation fields under `data`.
 
