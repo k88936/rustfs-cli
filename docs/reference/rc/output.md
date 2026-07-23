@@ -75,7 +75,7 @@ When migrating:
 5. For watch output, validate and process each JSON Lines record independently.
 6. For normalized metrics, retain labels and per-sample `collected_at` timestamps; do not infer one timestamp for the entire stream.
 7. Ignore unknown object properties while continuing to require documented fields and types.
-8. For KMS operations, treat `not-configured` as a successful status state; dispatch configuration/service results by `configure`, `reconfigure`, `start`, `restart`, or `stop`; dispatch key results by `key_create`, `key_delete`, or `key_cancel_deletion`; and never expect secret configuration or data-key fields.
+8. For KMS operations, treat `not-configured` as a successful status state; dispatch configuration/service results by `configure`, `reconfigure`, `start`, `restart`, or `stop`; dispatch key results by `key_create`, `key_delete`, or `key_cancel_deletion`; dispatch the non-exporting object diagnostic by `roundtrip`; and never expect temporary object names, content, digests, secret configuration, ciphertext, or data-key fields.
 
 Commands adopting version-operation records migrate only their version-aware JSON paths. Legacy JSON remains unchanged for unversioned `stat`, `rm`, and `cp` results where the server reports no version identifiers. Scripts selecting versions must dispatch on `schema_version: 3` and read operation fields under `data`.
 

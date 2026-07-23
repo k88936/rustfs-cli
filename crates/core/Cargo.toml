@@ -39,6 +39,7 @@ glob.workspace = true
 rustls-pki-types.workspace = true
 x509-parser.workspace = true
 zeroize.workspace = true
+getrandom.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
